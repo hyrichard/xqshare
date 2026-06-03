@@ -10,6 +10,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import islice
 from typing import Any, Dict, Optional
 
 import rpyc
@@ -106,6 +107,61 @@ def _init_logging(log_level="INFO"):
     global logger, api_logger
     logger = setup_logging(log_level=log_level)
     api_logger = logging.getLogger('api')
+
+
+def _is_callback_debug_enabled() -> bool:
+    """判断是否开启 callback 调试日志。"""
+    value = os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_logger() -> logging.Logger:
+    """获取可用的服务端 logger。"""
+    return logger or logging.getLogger(__name__)
+
+
+def _summarize_callback_value(value: Any, max_len: int = 120) -> str:
+    """生成回调参数摘要，避免大对象刷屏。"""
+    try:
+        if value is None:
+            return "None"
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, str):
+            return value[:max_len] if len(value) <= max_len else value[:max_len] + "..."
+        if isinstance(value, dict):
+            keys = list(islice(value.keys(), 5))
+            return f"dict[{len(value)} keys:{', '.join(map(str, keys))}{'...' if len(value) > 5 else ''}]"
+        if isinstance(value, (list, tuple, set)):
+            return f"{type(value).__name__}[len={len(value)}]"
+        if hasattr(value, "__class__"):
+            return f"<{value.__class__.__name__}>"
+        return str(type(value))
+    except Exception:
+        return "<unserializable>"
+
+
+def _summarize_callback_payload(args: tuple, kwargs: Dict[str, Any]) -> str:
+    """生成回调入参摘要。"""
+    parts = []
+    if args:
+        parts.append(f"args={_summarize_callback_value(args if len(args) != 1 else args[0])}")
+    if kwargs:
+        parts.append(f"kwargs={_summarize_callback_value(kwargs)}")
+    return " ".join(parts) if parts else "no_payload"
+
+
+def _log_callback_debug(phase: str, **fields: Any) -> None:
+    """输出统一格式的 callback 调试日志。"""
+    if not _is_callback_debug_enabled():
+        return
+
+    payload = {
+        "thread": threading.current_thread().name,
+        **fields,
+    }
+    message = " ".join(f"{key}={value}" for key, value in payload.items() if value is not None)
+    _get_logger().info(f"[CB][SERVER][{phase}] {message}")
 
 
 # ==================== 日志装饰器 ====================
@@ -276,10 +332,24 @@ class CallbackManager:
                 metadata=metadata or {},
                 one_shot=one_shot,
             )
+        _log_callback_debug(
+            "REGISTER",
+            callback_id=binding_id,
+            kind=kind,
+            client=client_info,
+            one_shot=one_shot,
+            metadata=_summarize_callback_value(metadata or {}),
+        )
 
     def unregister(self, binding_id: str):
         with self._lock:
-            self._callbacks.pop(binding_id, None)
+            info = self._callbacks.pop(binding_id, None)
+        _log_callback_debug(
+            "UNREGISTER",
+            callback_id=binding_id,
+            kind=getattr(info, "kind", None),
+            client=getattr(info, "client_info", None),
+        )
 
     def invoke(self, binding_id: str, *args, **kwargs):
         with self._lock:
@@ -288,8 +358,43 @@ class CallbackManager:
             return False
 
         info.call_count += 1
+        debug_enabled = _is_callback_debug_enabled()
+        start_time = None
+        if debug_enabled:
+            start_time = time.perf_counter()
+            _log_callback_debug(
+                "FORWARD_START",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
         try:
-            return info.dispatcher(binding_id, *args, **kwargs)
+            result = info.dispatcher(binding_id, *args, **kwargs)
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_DONE",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
+            return result
+        except Exception as exc:
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_ERROR",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
+            raise
         finally:
             if info.one_shot:
                 self.unregister(binding_id)
@@ -301,7 +406,46 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        return info.dispatcher(binding_id, event_name, *args, **kwargs)
+        debug_enabled = _is_callback_debug_enabled()
+        start_time = None
+        if debug_enabled:
+            start_time = time.perf_counter()
+            _log_callback_debug(
+                "FORWARD_START",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                event=event_name,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
+        try:
+            result = info.dispatcher(binding_id, event_name, *args, **kwargs)
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_DONE",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
+            return result
+        except Exception as exc:
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_ERROR",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
+            raise
 
     def list_callbacks(self):
         with self._lock:
@@ -334,6 +478,13 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
     def __getattr__(self, name):
         if name.startswith("on_"):
             def handler(*args, **kwargs):
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        "EVENT_RECV",
+                        callback_id=self._binding_id,
+                        event=name,
+                        payload=_summarize_callback_payload(args, kwargs),
+                    )
                 return self._callback_manager.invoke_event(self._binding_id, name, *args, **kwargs)
             return handler
         raise AttributeError(name)
@@ -443,6 +594,13 @@ class TraderBridge:
         )
         self._callback_binding_id = binding_id
         self._callback_adapter = TraderCallbackAdapter(binding_id, self._callback_manager)
+        _log_callback_debug(
+            "REGISTER",
+            callback_id=binding_id,
+            kind="xttrader_callback",
+            client=self._client_info_getter(),
+            session_id=self.session_id,
+        )
         if hasattr(self._trader, "register_callback"):
             return self._trader.register_callback(self._callback_adapter)
         return None
@@ -457,8 +615,26 @@ class TraderBridge:
             metadata={"method_name": method_name},
             one_shot=True,
         )
+        _log_callback_debug(
+            "ASYNC_REGISTER",
+            callback_id=callback_id,
+            kind="xttrader_async",
+            client=self._client_info_getter(),
+            method=method_name,
+            session_id=self.session_id,
+            payload=_summarize_callback_payload(tuple(args), dict(kwargs)) if _is_callback_debug_enabled() else None,
+        )
 
         def on_result(*cb_args, **cb_kwargs):
+            if _is_callback_debug_enabled():
+                _log_callback_debug(
+                    "ASYNC_RESULT_RECV",
+                    callback_id=callback_id,
+                    kind="xttrader_async",
+                    client=self._client_info_getter(),
+                    method=method_name,
+                    payload=_summarize_callback_payload(cb_args, cb_kwargs),
+                )
             return self._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
 
         method = getattr(self._trader, method_name)
