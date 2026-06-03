@@ -70,7 +70,6 @@ API_PERMISSIONS: Dict[str, Permission] = {
 
     # ==================== tick 权限 ====================
     "xtdata.get_full_tick": Permission.TICK,
-    "xtdata.subscribe_quote": Permission.TICK,
 
     # ==================== trade 权限 ====================
     # 精确匹配：查询方法需要 TRADE_QUERY
@@ -116,9 +115,16 @@ API_PERMISSIONS: Dict[str, Permission] = {
 
     # ==================== callback 权限 ====================
     # 订阅类 API（包含 callback 参数）
+    "subscribe_xtdata_bridge": Permission.CALLBACK,
+    "unsubscribe_xtdata_bridge": Permission.CALLBACK,
     "xtdata.subscribe_whole_quote": Permission.CALLBACK,
     "xtdata.subscribe_full_tick": Permission.CALLBACK,
     "xtdata.subscribe_quote": Permission.CALLBACK,
+    "xtdata.subscribe_quote2": Permission.CALLBACK,
+    "xtdata.subscribe_l2thousand": Permission.CALLBACK,
+    "xtdata.subscribe_l2thousand_queue": Permission.CALLBACK,
+    "xtdata.subscribe_formula": Permission.CALLBACK,
+    "xtdata.bind_formula": Permission.CALLBACK,
     # 异步测试回调
     "test_async_callback": Permission.CALLBACK,
 }

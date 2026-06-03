@@ -2,33 +2,37 @@
 XtQuant Share (xqshare) Server - Run on Windows to provide xtquant proxy service
 """
 
-import rpyc
-from rpyc.utils.server import ThreadedServer
-import time
+import json
+import logging
 import os
 import ssl
-import logging
-import functools
-import json
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-# 导入权限模块
+import rpyc
+from rpyc.utils.server import ThreadedServer
+
 from .auth import (
-    PermissionChecker,
-    PermissionError,
     AccountLevel,
-    Permission,
+    PermissionError,
     get_permission_checker,
 )
 
 # Import xtquant (only available on Windows)
 try:
+    import xtquant.xtconstant as xtconstant
     import xtquant.xtdata as xtdata
     import xtquant.xttrader as xttrader
     import xtquant.xttype as xttype
-    import xtquant.xtconstant as xtconstant
     from xtquant.xttrader import XtQuantTrader
+    try:
+        from xtquant.xttrader import XtQuantTraderCallback as XtQuantTraderCallbackBase
+    except ImportError:
+        class XtQuantTraderCallbackBase:  # type: ignore[no-redef]
+            pass
     XTQUANT_AVAILABLE = True
 except ImportError:
     XTQUANT_AVAILABLE = False
@@ -38,7 +42,9 @@ except ImportError:
     xtconstant = None
     XtQuantTrader = None
 
-# xtview 模块单独导入（某些版本可能不存在）
+    class XtQuantTraderCallbackBase:  # type: ignore[no-redef]
+        pass
+
 try:
     import xtquant.xtview as xtview
     XTVIEW_AVAILABLE = True
@@ -54,42 +60,46 @@ def setup_logging(log_dir: str = None, log_level: str = "INFO"):
     if log_dir is None:
         log_dir = os.environ.get("XQSHARE_LOG_DIR", "logs")
     os.makedirs(log_dir, exist_ok=True)
-    
+
     formatter = logging.Formatter(
         fmt='%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
+
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level.upper()))
-    
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    console_handler.setLevel(logging.INFO)
-    root_logger.addHandler(console_handler)
-    
-    file_handler = logging.FileHandler(
-        os.path.join(log_dir, f"xtquant_service_{datetime.now().strftime('%Y%m%d')}.log"),
-        encoding='utf-8'
-    )
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.DEBUG)
-    root_logger.addHandler(file_handler)
-    
-    api_handler = logging.FileHandler(
-        os.path.join(log_dir, f"api_calls_{datetime.now().strftime('%Y%m%d')}.log"),
-        encoding='utf-8'
-    )
-    api_handler.setFormatter(formatter)
+
+    if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(logging.INFO)
+        root_logger.addHandler(console_handler)
+
+    service_log = os.path.join(log_dir, f"xtquant_service_{datetime.now().strftime('%Y%m%d')}.log")
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(service_log)
+               for h in root_logger.handlers):
+        file_handler = logging.FileHandler(service_log, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
+        root_logger.addHandler(file_handler)
+
+    api_log = os.path.join(log_dir, f"api_calls_{datetime.now().strftime('%Y%m%d')}.log")
     api_logger = logging.getLogger('api')
-    api_logger.addHandler(api_handler)
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(api_log)
+               for h in api_logger.handlers):
+        api_handler = logging.FileHandler(api_log, encoding='utf-8')
+        api_handler.setFormatter(formatter)
+        api_logger.addHandler(api_handler)
     api_logger.setLevel(logging.DEBUG)
-    
+
     return logging.getLogger(__name__)
 
 
 logger = None
 api_logger = None
+XTDATA_UNSUBSCRIBE_METHODS = {
+    "subscribe_formula": "unsubscribe_formula",
+}
 
 
 def _init_logging(log_level="INFO"):
@@ -105,7 +115,7 @@ def _log_call(name: str, client_info: str, func, *args, **kwargs):
     try:
         args_str = str(args)[:200] if args else ""
         kwargs_str = str(kwargs)[:200] if kwargs else ""
-    except:
+    except Exception:
         args_str = "<unserializable>"
         kwargs_str = ""
 
@@ -140,19 +150,18 @@ def _summarize_result(result: Any, max_len: int = 200) -> str:
     try:
         if result is None:
             return "None"
-        elif isinstance(result, (int, float, bool, str)):
+        if isinstance(result, (int, float, bool, str)):
             s = str(result)
             return s if len(s) <= max_len else s[:max_len] + "..."
-        elif isinstance(result, (list, tuple)):
+        if isinstance(result, (list, tuple)):
             return f"{type(result).__name__}[len={len(result)}]"
-        elif isinstance(result, dict):
+        if isinstance(result, dict):
             keys = list(result.keys())[:5]
             return f"dict{{{', '.join(map(str, keys))}{'...' if len(result) > 5 else ''}}}"
-        elif hasattr(result, '__class__'):
+        if hasattr(result, '__class__'):
             return f"<{result.__class__.__module__}.{result.__class__.__name__}>"
-        else:
-            return str(type(result))
-    except:
+        return str(type(result))
+    except Exception:
         return "<unserializable>"
 
 
@@ -160,47 +169,30 @@ def _summarize_result(result: Any, max_len: int = 200) -> str:
 
 class AuthError(Exception):
     """认证错误"""
-    pass
 
 
 # ==================== 序列化传输优化 ====================
 
-# 需要序列化传输的类型标记
 SERIALIZED_MARKER = "__xqshare_serialized__"
 
 
 def _serialize_for_transfer(result):
-    """将结果序列化以优化 RPyC 传输性能
-
-    对于大型列表/字典/DataFrame，序列化后传输比逐元素传输快很多。
-
-    Args:
-        result: API 调用返回值
-
-    Returns:
-        序列化后的数据结构，包含类型标记和序列化数据
-    """
-    import io
-
+    """将结果序列化以优化 RPyC 传输性能"""
     if result is None:
         return {SERIALIZED_MARKER: "none", "data": None}
 
-    # DataFrame: 转为 CSV 字符串
     try:
         import pandas as pd
         if isinstance(result, pd.DataFrame):
-            csv_str = result.to_csv(index=True)
-            return {SERIALIZED_MARKER: "dataframe_csv", "data": csv_str}
+            return {SERIALIZED_MARKER: "dataframe_csv", "data": result.to_csv(index=True)}
     except ImportError:
         pass
 
-    # 字典: 检查是否包含 DataFrame（递归检查）
     if isinstance(result, dict):
         try:
             import pandas as pd
 
             def has_dataframe_recursive(obj):
-                """递归检查对象中是否包含 DataFrame"""
                 if isinstance(obj, pd.DataFrame):
                     return True
                 if isinstance(obj, dict):
@@ -210,7 +202,6 @@ def _serialize_for_transfer(result):
                 return False
 
             def serialize_dataframes(obj):
-                """递归序列化 DataFrame"""
                 if isinstance(obj, pd.DataFrame):
                     return {"__df__": True, "csv": obj.to_csv(index=True)}
                 if isinstance(obj, dict):
@@ -226,25 +217,126 @@ def _serialize_for_transfer(result):
         except ImportError:
             pass
 
-        # 普通字典: JSON 序列化
         try:
             json_str = json.dumps(result, ensure_ascii=False, default=str)
             return {SERIALIZED_MARKER: "json", "data": json_str}
         except (TypeError, ValueError):
             pass
 
-    # 列表: JSON 序列化
     if isinstance(result, (list, tuple)):
         try:
             json_str = json.dumps(result, ensure_ascii=False, default=str)
             return {SERIALIZED_MARKER: "json", "data": json_str}
         except (TypeError, ValueError):
-            # 无法 JSON 序列化，检查是否需要包装列表元素
-            # 对于包含复杂对象的列表，不进行序列化，让 RPyC 原样传输
             pass
 
-    # 其他类型原样返回
     return result
+
+
+def _check_permission(permission_checker, account_level, method_name: str, args=(), kwargs=None):
+    if permission_checker is None or account_level is None:
+        return None
+    return permission_checker.check_api_permission(account_level, method_name, args, kwargs or {})
+
+
+def _get_xtdata_unsubscribe_method(method_name: str) -> str:
+    """根据订阅方法名返回对应的取消订阅方法。"""
+    return XTDATA_UNSUBSCRIBE_METHODS.get(method_name, "unsubscribe_quote")
+
+
+# ==================== 回调桥接状态 ====================
+
+@dataclass
+class CallbackInfo:
+    binding_id: str
+    dispatcher: Any
+    kind: str
+    client_info: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    one_shot: bool = False
+    registered_at: float = field(default_factory=time.time)
+    call_count: int = 0
+
+
+class CallbackManager:
+    """管理客户端注册的回调绑定。"""
+
+    def __init__(self):
+        self._callbacks: Dict[str, CallbackInfo] = {}
+        self._lock = threading.RLock()
+
+    def register(self, binding_id: str, dispatcher, kind: str, client_info: str,
+                 metadata: Optional[Dict[str, Any]] = None, one_shot: bool = False):
+        with self._lock:
+            self._callbacks[binding_id] = CallbackInfo(
+                binding_id=binding_id,
+                dispatcher=dispatcher,
+                kind=kind,
+                client_info=client_info,
+                metadata=metadata or {},
+                one_shot=one_shot,
+            )
+
+    def unregister(self, binding_id: str):
+        with self._lock:
+            self._callbacks.pop(binding_id, None)
+
+    def invoke(self, binding_id: str, *args, **kwargs):
+        with self._lock:
+            info = self._callbacks.get(binding_id)
+        if info is None:
+            return False
+
+        info.call_count += 1
+        try:
+            return info.dispatcher(binding_id, *args, **kwargs)
+        finally:
+            if info.one_shot:
+                self.unregister(binding_id)
+
+    def invoke_event(self, binding_id: str, event_name: str, *args, **kwargs):
+        with self._lock:
+            info = self._callbacks.get(binding_id)
+        if info is None:
+            return False
+
+        info.call_count += 1
+        return info.dispatcher(binding_id, event_name, *args, **kwargs)
+
+    def list_callbacks(self):
+        with self._lock:
+            return {
+                binding_id: {
+                    "kind": info.kind,
+                    "client": info.client_info,
+                    "registered_at": info.registered_at,
+                    "call_count": info.call_count,
+                    "metadata": dict(info.metadata),
+                }
+                for binding_id, info in self._callbacks.items()
+            }
+
+    def clear_client_callbacks(self, client_info: str):
+        with self._lock:
+            to_remove = [binding_id for binding_id, info in self._callbacks.items() if info.client_info == client_info]
+            for binding_id in to_remove:
+                self._callbacks.pop(binding_id, None)
+        return to_remove
+
+
+class TraderCallbackAdapter(XtQuantTraderCallbackBase):
+    """将 xttrader 回调转发到客户端。"""
+
+    def __init__(self, binding_id: str, callback_manager: CallbackManager):
+        self._binding_id = binding_id
+        self._callback_manager = callback_manager
+
+    def __getattr__(self, name):
+        if name.startswith("on_"):
+            def handler(*args, **kwargs):
+                return self._callback_manager.invoke_event(self._binding_id, name, *args, **kwargs)
+            return handler
+        raise AttributeError(name)
 
 
 # ==================== 模块代理（带日志和权限检查） ====================
@@ -268,29 +360,21 @@ class LoggingProxy:
 
         attr = getattr(target, name)
 
-        # 如果是可调用对象，包装成带日志和权限检查的版本
         if callable(attr):
             def wrapper(*args, **kwargs):
                 full_name = f"{target_name}.{name}"
-
-                # 权限检查
-                if permission_checker and account_level:
-                    error = permission_checker.check_api_permission(
-                        account_level, full_name, args, kwargs
-                    )
-                    if error:
-                        api_logger.warning(f"[权限拒绝] {full_name} | client={get_client_info()} | {error}")
-                        raise error
+                error = _check_permission(permission_checker, account_level, full_name, args, kwargs)
+                if error:
+                    api_logger.warning(f"[权限拒绝] {full_name} | client={get_client_info()} | {error}")
+                    raise error
 
                 result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
 
-                # 如果返回的是复杂对象（非基本类型），递归包装
                 if result is not None and hasattr(result, '__class__'):
                     if not isinstance(result, (int, float, str, bool, list, dict, tuple, type(None), bytes)):
                         if not result.__class__.__module__.startswith('builtins'):
                             return LoggingProxy(result, full_name, get_client_info, permission_checker, account_level)
 
-                # 处理列表：检查是否包含复杂对象
                 if isinstance(result, list):
                     wrapped_list = []
                     has_complex_obj = False
@@ -305,8 +389,8 @@ class LoggingProxy:
                     if has_complex_obj:
                         return wrapped_list
 
-                # 序列化传输优化：将列表/字典/DataFrame 序列化以减少远程调用
                 return _serialize_for_transfer(result)
+
             wrapper.__name__ = name
             return wrapper
 
@@ -321,8 +405,69 @@ class LoggingProxy:
     def __repr__(self):
         return repr(object.__getattribute__(self, '_target'))
 
-# 兼容别名
+
 LoggingModuleProxy = LoggingProxy
+
+
+class TraderBridge:
+    """交易对象桥接层：保留原 API，同时接管 callback 场景。"""
+
+    def __init__(self, trader, userdata_path: Optional[str], session_id: Optional[int],
+                 client_info_getter, permission_checker, account_level,
+                 callback_manager: CallbackManager):
+        self._trader = trader
+        self._client_info_getter = client_info_getter
+        self._permission_checker = permission_checker
+        self._account_level = account_level
+        self._callback_manager = callback_manager
+        self._proxy = LoggingProxy(trader, 'xttrader', client_info_getter, permission_checker, account_level)
+        self._callback_binding_id = None
+        self._callback_adapter = None
+        self.userdata_path = userdata_path
+        self.session_id = session_id
+
+    def _check(self, method_name: str, args=(), kwargs=None):
+        error = _check_permission(self._permission_checker, self._account_level, method_name, args, kwargs)
+        if error:
+            api_logger.warning(f"[权限拒绝] {method_name} | client={self._client_info_getter()} | {error}")
+            raise error
+
+    def register_callback_bridge(self, binding_id: str, dispatcher):
+        self._check("xttrader.register_callback")
+        self._callback_manager.register(
+            binding_id,
+            dispatcher,
+            kind="xttrader_callback",
+            client_info=self._client_info_getter(),
+            metadata={"bridge": "register_callback"},
+        )
+        self._callback_binding_id = binding_id
+        self._callback_adapter = TraderCallbackAdapter(binding_id, self._callback_manager)
+        if hasattr(self._trader, "register_callback"):
+            return self._trader.register_callback(self._callback_adapter)
+        return None
+
+    def invoke_async_bridge(self, method_name: str, args, kwargs, callback_id: str, dispatcher):
+        self._check(f"xttrader.{method_name}", tuple(args), dict(kwargs))
+        self._callback_manager.register(
+            callback_id,
+            dispatcher,
+            kind="xttrader_async",
+            client_info=self._client_info_getter(),
+            metadata={"method_name": method_name},
+            one_shot=True,
+        )
+
+        def on_result(*cb_args, **cb_kwargs):
+            return self._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
+
+        method = getattr(self._trader, method_name)
+        call_kwargs = dict(kwargs)
+        call_kwargs["callback"] = on_result
+        return _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._proxy, name)
 
 
 # ==================== 服务类 ====================
@@ -335,15 +480,15 @@ class XtQuantService(rpyc.Service):
     _xttype = xttype
     _xtconstant = xtconstant
     _xtview = xtview
-    _permission_checker = None  # 类级别的权限检查器
+    _permission_checker = None
+    _callback_manager = CallbackManager()
+    _xtdata_subscriptions: Dict[Any, Dict[str, Any]] = {}
 
     def on_connect(self, conn):
         self._conn = conn
         self._authenticated = False
         self._client_id = None
-        self._account_level = AccountLevel.FREE  # 默认为免费等级
-        # 权限检查器在服务启动时已加载
-        # 兼容不同版本 rpyc：尝试获取客户端地址
+        self._account_level = AccountLevel.FREE
         try:
             if hasattr(conn, 'peer'):
                 self._client_info = f"{conn.peer}"
@@ -362,37 +507,46 @@ class XtQuantService(rpyc.Service):
 
     def on_disconnect(self, conn):
         client_info = getattr(self, '_client_info', 'unknown')
+        to_remove = [
+            server_seq for server_seq, info in list(XtQuantService._xtdata_subscriptions.items())
+            if info.get("client_info") == client_info
+        ]
+        for server_seq in to_remove:
+            info = XtQuantService._xtdata_subscriptions.pop(server_seq, None)
+            if info is None:
+                continue
+            try:
+                unsubscribe = getattr(self._xtdata, info.get("unsubscribe_method", "unsubscribe_quote"))
+                unsubscribe(server_seq)
+            except Exception:
+                pass
+            callback_id = info.get("callback_id")
+            if callback_id:
+                XtQuantService._callback_manager.unregister(callback_id)
+
+        XtQuantService._callback_manager.clear_client_callbacks(client_info)
         logger.info(f"[断开] 客户端离开: {client_info}")
 
     def _delayed_disconnect(self, delay: float = 0.5):
-        """延迟断开连接，确保异常能传输到客户端"""
-        import threading
         def _close():
             try:
                 self._conn.close()
-            except:
+            except Exception:
                 pass
         threading.Timer(delay, _close).start()
 
     def _require_auth(self):
-        """检查认证状态，未认证则抛出异常并断开连接"""
         if not self._authenticated:
             logger.warning(f"[未授权] 未认证的访问尝试: {self._client_info}")
             self._delayed_disconnect()
             raise AuthError("未授权访问，请先认证")
 
-    # ==================== 认证接口 ====================
-
     @log_api_call("authenticate")
     def exposed_authenticate(self, client_id, client_secret):
         checker = XtQuantService._permission_checker
-
-        # 检查配置文件是否变更，如果变更则重新加载
         checker.check_and_reload_if_changed()
 
-        # 验证密钥并获取账号等级
         valid, account_level = checker.verify_secret(client_id, client_secret)
-
         if not valid:
             logger.warning(f"[认证失败] client_id={client_id}")
             self._delayed_disconnect()
@@ -409,13 +563,21 @@ class XtQuantService(rpyc.Service):
     def exposed_heartbeat(self):
         return "pong"
 
-    # ==================== 模块代理接口 ====================
-
     @log_api_call("get_xtdata")
     def exposed_get_xtdata(self):
         self._require_auth()
         return LoggingModuleProxy(
             self._xtdata, 'xtdata',
+            lambda: self._client_info,
+            XtQuantService._permission_checker,
+            self._account_level
+        )
+
+    @log_api_call("get_xttrader")
+    def exposed_get_xttrader(self):
+        self._require_auth()
+        return LoggingModuleProxy(
+            self._xttrader, 'xttrader',
             lambda: self._client_info,
             XtQuantService._permission_checker,
             self._account_level
@@ -444,52 +606,117 @@ class XtQuantService(rpyc.Service):
 
     @log_api_call("create_trader")
     def exposed_create_trader(self, userdata_path: str = None, session_id: int = None):
-        """
-        创建交易实例（不自动启动，由客户端控制生命周期）
-
-        Args:
-            userdata_path: QMT 客户端 userdata_mini 目录路径（可选，可通过环境变量配置）
-            session_id: 会话ID（可选，默认自动生成时间戳）
-
-        Returns:
-            XtQuantTrader 实例（需客户端调用 start() 和 connect()）
-        """
         self._require_auth()
-        # 检查 trade 权限
-        if self._account_level:
-            error = XtQuantService._permission_checker.check_api_permission(
-                self._account_level, "create_xttrader"
-            )
-            if error:
-                logger.warning(f"[权限拒绝] create_xttrader | client={self._client_info} | {error}")
-                raise error
+        error = _check_permission(XtQuantService._permission_checker, self._account_level, "create_xttrader")
+        if error:
+            logger.warning(f"[权限拒绝] create_xttrader | client={self._client_info} | {error}")
+            raise error
         if not XTQUANT_AVAILABLE:
             raise RuntimeError("xtquant 库未安装")
 
-        # 从环境变量获取默认值
         if userdata_path is None:
             userdata_path = os.environ.get("QMT_USERDATA_PATH")
         if userdata_path is None:
             raise ValueError("必须提供 userdata_path 参数或设置 QMT_USERDATA_PATH 环境变量")
 
-        # 自动生成 session_id
         if session_id is None:
             session_id = int(time.time())
 
-        # 创建 trader（不自动启动，由客户端控制生命周期）
         trader = XtQuantTrader(userdata_path, session_id)
-
         logger.info(f"[创建Trader] userdata_path={userdata_path} | session_id={session_id}")
-
-        # 用 LoggingProxy 包装 trader，支持日志记录和序列化
-        return LoggingProxy(
-            trader, 'xttrader',
+        return TraderBridge(
+            trader,
+            userdata_path,
+            session_id,
             lambda: self._client_info,
             XtQuantService._permission_checker,
-            self._account_level
+            self._account_level,
+            XtQuantService._callback_manager,
         )
 
-    # ==================== 辅助接口 ====================
+    @log_api_call("subscribe_xtdata_bridge")
+    def exposed_subscribe_xtdata_bridge(self, method_name: str, args: tuple, kwargs: dict,
+                                        callback_id: str, dispatcher):
+        self._require_auth()
+
+        full_name = f"xtdata.{method_name}"
+        permission_kwargs = dict(kwargs)
+        permission_kwargs["callback"] = "<bridge>"
+        error = _check_permission(XtQuantService._permission_checker, self._account_level, full_name, args, permission_kwargs)
+        if error:
+            logger.warning(f"[权限拒绝] {full_name} | client={self._client_info} | {error}")
+            raise error
+
+        XtQuantService._callback_manager.register(
+            callback_id,
+            dispatcher,
+            kind="xtdata_subscription",
+            client_info=self._client_info,
+            metadata={"method_name": method_name},
+        )
+
+        try:
+            target = getattr(self._xtdata, method_name)
+
+            def on_data(*cb_args, **cb_kwargs):
+                return XtQuantService._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
+
+            call_kwargs = dict(kwargs)
+            call_kwargs["callback"] = on_data
+            server_seq = target(*args, **call_kwargs)
+            XtQuantService._xtdata_subscriptions[server_seq] = {
+                "client_info": self._client_info,
+                "callback_id": callback_id,
+                "method_name": method_name,
+                "unsubscribe_method": _get_xtdata_unsubscribe_method(method_name),
+            }
+            return server_seq
+        except Exception:
+            XtQuantService._callback_manager.unregister(callback_id)
+            raise
+
+    @log_api_call("unsubscribe_xtdata_bridge")
+    def exposed_unsubscribe_xtdata_bridge(self, server_seq):
+        self._require_auth()
+        info = XtQuantService._xtdata_subscriptions.get(server_seq)
+        if info is None:
+            raise ValueError(f"未找到订阅: {server_seq}")
+        if info.get("client_info") != self._client_info:
+            raise AuthError("无权取消其他客户端的订阅")
+
+        unsubscribe_method = info.get("unsubscribe_method", "unsubscribe_quote")
+        callback_id = info.get("callback_id")
+
+        result = getattr(self._xtdata, unsubscribe_method)(server_seq)
+        if callback_id:
+            XtQuantService._callback_manager.unregister(callback_id)
+        XtQuantService._xtdata_subscriptions.pop(server_seq, None)
+        return result
+
+    @log_api_call("download_history_data2")
+    def exposed_download_history_data2(self, stock_list: list, period: str = "1d",
+                                       start_time: str = "", end_time: str = "", incrementally: bool = None):
+        status = {'finished': 0, 'total': 0, 'done': False, 'result': {}, 'message': ''}
+
+        def on_progress(data):
+            status['finished'] = data.get('finished', 0)
+            status['total'] = data.get('total', 0)
+            status['done'] = status['finished'] >= status['total']
+            status['message'] = data.get('message', '')
+            if 'result' in data:
+                import datetime as dt
+                from xtquant import xtbson as bson
+                region_result = bson.BSON.decode(data.get('result'))
+                for stock, info in region_result.items():
+                    info['start_time'] = str(dt.datetime.fromtimestamp(info.get('start_time') / 1000))
+                    info['end_time'] = str(dt.datetime.fromtimestamp(info.get('end_time') / 1000))
+                    status['result'][stock] = info
+
+        self._xtdata.download_history_data2(
+            stock_list, period, start_time, end_time,
+            callback=on_progress, incrementally=incrementally
+        )
+        return status
 
     @log_api_call("get_all_stocks")
     def exposed_get_all_stocks(self):
@@ -501,48 +728,14 @@ class XtQuantService(rpyc.Service):
         self._require_auth()
         return self._xtdata.get_stock_list_in_sector("沪深指数")
 
-    # ==================== 服务端封装接口 ====================
-
-    @log_api_call("download_history_data2")
-    def exposed_download_history_data2(self, stock_list: list, period: str = "1d",
-                                        start_time: str = "", end_time: str = "", incrementally: bool = None):
-        """
-        下载历史数据（服务端封装，避免回调传输问题）
-        返回: {'finished': n, 'total': n, 'result': {...}}
-        """
-        status = {'finished': 0, 'total': 0, 'done': False, 'result': {}, 'message': ''}
-
-        def on_progress(data):
-            status['finished'] = data.get('finished', 0)
-            status['total'] = data.get('total', 0)
-            status['done'] = status['finished'] >= status['total']
-            status['message'] = data.get('message', '')
-            if 'result' in data:
-                import datetime as dt
-                from xtquant import xtbson as bson
-                regino_result = bson.BSON.decode(data.get('result'))
-                for stock, info in regino_result.items():
-                    info['start_time'] = str(dt.datetime.fromtimestamp(info.get('start_time') / 1000))
-                    info['end_time'] = str(dt.datetime.fromtimestamp(info.get('end_time') / 1000))
-                    status['result'][stock] = info
-
-        # 调用原始方法（incrementally 参数需要转换为 None 或 bool）
-        inc = incrementally
-        self._xtdata.download_history_data2(
-            stock_list, period, start_time, end_time,
-            callback=on_progress, incrementally=inc
-        )
-
-        return status
-
-    # ==================== 服务状态 ====================
-
     @log_api_call("get_service_status")
     def exposed_get_service_status(self):
         self._require_auth()
         return {
             "uptime": time.time() - getattr(self, '_start_time', time.time()),
             "client_id": self._client_id,
+            "active_callbacks": len(XtQuantService._callback_manager.list_callbacks()),
+            "active_subscriptions": len(XtQuantService._xtdata_subscriptions),
         }
 
     @log_api_call("ping")
@@ -551,25 +744,11 @@ class XtQuantService(rpyc.Service):
 
     @log_api_call("test_async_callback")
     def exposed_test_async_callback(self, callback_func, delay: float = 2.0, count: int = 5):
-        """
-        测试 RPyC netref 异步回调机制
-        :param callback_func: 客户端传递的回调函数（netref）
-        :param delay: 每次回调间隔秒数
-        :param count: 回调次数
-        :return: 立即返回 "已启动"
-        """
         self._require_auth()
-        # 检查 callback 权限
-        if self._account_level:
-            error = XtQuantService._permission_checker.check_api_permission(
-                self._account_level, "test_async_callback"
-            )
-            if error:
-                logger.warning(f"[权限拒绝] test_async_callback | client={self._client_info} | {error}")
-                raise error
-
-        import threading
-        import time
+        error = _check_permission(XtQuantService._permission_checker, self._account_level, "test_async_callback")
+        if error:
+            logger.warning(f"[权限拒绝] test_async_callback | client={self._client_info} | {error}")
+            raise error
 
         def async_call():
             for i in range(count):
@@ -596,18 +775,7 @@ def create_ssl_context(certfile=None, keyfile=None):
 
 
 def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfile=None, log_level="INFO", env_file=None):
-    """启动服务
-
-    Args:
-        host: 监听地址
-        port: 监听端口
-        use_ssl: 是否启用 SSL
-        certfile: SSL 证书文件
-        keyfile: SSL 密钥文件
-        log_level: 日志级别
-        env_file: 环境变量文件路径（None 时自动查找 .env）
-    """
-    # 加载环境变量文件（None 时自动查找 .env）
+    """启动服务"""
     try:
         from dotenv import load_dotenv
         load_dotenv(env_file)
@@ -631,13 +799,12 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
     print(f"  SSL 加密: {'启用' if use_ssl else '禁用'}")
     print(f"  日志级别: {log_level}")
     print("=" * 70)
-    
-    # 预加载权限检查器（加载 clients.yaml 配置）
+
     if XtQuantService._permission_checker is None:
         XtQuantService._permission_checker = get_permission_checker()
 
     logger.info(f"服务启动 | host={host} | port={port} | ssl={use_ssl}")
-    
+
     config = {
         'allow_public_attrs': True,
         'allow_pickle': True,
@@ -647,7 +814,7 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
         'allow_all_attrs': True,
         'sync_request_timeout': 300,
     }
-    
+
     ssl_context = None
     if use_ssl:
         ssl_context = create_ssl_context(certfile, keyfile)
@@ -657,25 +824,17 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
         else:
             logger.warning("SSL 证书加载失败")
             print("  ⚠ SSL 证书加载失败")
-    
-    # 构建 ThreadedServer 参数（兼容不同 rpyc 版本）
+
     server_kwargs = {
         'hostname': host,
         'port': port,
         'protocol_config': config,
     }
-    
-    # 尝试使用 ssl_context（新版本 rpyc）
+
     try:
         server = ThreadedServer(XtQuantService, ssl_context=ssl_context, **server_kwargs)
     except TypeError:
-        # 旧版本 rpyc 不支持 ssl_context，使用其他方式
         if ssl_context:
-            # 对于旧版本，通过 protocol_config 传递 SSL
-            import socket
-            import ssl as ssl_module
-            
-            # 创建 SSL 包装的 socket
             class SSLThreadedServer(ThreadedServer):
                 def _accept_method(self, sock):
                     try:
@@ -683,15 +842,15 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
                     except Exception as e:
                         logger.error(f"SSL 包装失败: {e}")
                         raise
-            
+
             server = SSLThreadedServer(XtQuantService, **server_kwargs)
             logger.info("使用兼容模式启动 SSL")
         else:
             server = ThreadedServer(XtQuantService, **server_kwargs)
-    
+
     print("\n  服务已启动，等待客户端连接...")
     print("  按 Ctrl+C 停止服务\n")
-    
+
     try:
         server.start()
     except KeyboardInterrupt:

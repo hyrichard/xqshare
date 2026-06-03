@@ -127,8 +127,8 @@ xttrader --account-id "12345678" order_stock --stock-code "000001.SZ" --order-ty
 
 ### 限制
 
-- **不支持订阅功能**：以 `subscribe` 开头的命令（需要回调函数）
-- **不支持回调参数**：`callback` 参数（需要使用 Python API）
+- **不支持订阅功能**：以 `subscribe` 开头的命令（CLI 当前不支持交互式回调）
+- **不支持回调参数**：`callback` 参数（请使用 Python API）
 - **交易工具限制**：不支持以 `register` 开头的命令
 
 **基础下载周期**：
@@ -357,7 +357,6 @@ xt = XtQuantRemote("192.168.1.100", log_level="DEBUG")
 | max_retries | 最大重试次数 | 5 |
 | heartbeat_interval | 心跳间隔(秒) | 30 |
 | log_level | 日志级别 | INFO |
-| callback_port | 回调服务器端口 | 0(自动) |
 
 ### 服务端参数
 
@@ -610,7 +609,7 @@ telnet 192.168.1.100 18812
 # 客户端查询服务端状态
 status = xt.get_service_status()
 print(status)
-# {'uptime': 3600, 'active_tokens': 2, 'active_callbacks': 5}
+# {'uptime': 3600, 'client_id': 'my-app', 'active_callbacks': 5, 'active_subscriptions': 1}
 ```
 
 ---

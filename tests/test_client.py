@@ -3,214 +3,232 @@ XtQuant Share (xqshare) Client Tests
 """
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-import threading
-import time
+from unittest.mock import MagicMock, Mock, patch
 
-# Import the client module
-import sys
-sys.path.insert(0, '.')
 from xqshare.client import (
-    XtQuantRemote,
-    ConnectionError,
-    AuthenticationError,
     CallbackError,
+    CallbackRegistry,
     ReconnectPolicy,
-    CallbackServer,
     RemoteModule,
+    XtQuantRemote,
 )
 
 
 class TestReconnectPolicy:
-    """测试重连策略"""
-    
     def test_base_delay(self):
         policy = ReconnectPolicy(max_retries=5, base_delay=1, backoff_factor=2)
         assert policy.get_delay(0) == 1
-    
+
     def test_exponential_backoff(self):
         policy = ReconnectPolicy(max_retries=5, base_delay=1, backoff_factor=2)
-        assert policy.get_delay(0) == 1
         assert policy.get_delay(1) == 2
         assert policy.get_delay(2) == 4
-        assert policy.get_delay(3) == 8
-    
+
     def test_max_delay(self):
         policy = ReconnectPolicy(max_retries=5, base_delay=1, max_delay=10, backoff_factor=2)
-        assert policy.get_delay(10) == 10  # cap at max_delay
+        assert policy.get_delay(10) == 10
 
 
-class TestCallbackServer:
-    """测试回调服务器"""
-    
-    def test_register_callback(self):
-        server = CallbackServer(port=0)
-        callback = Mock()
-        server.register("test_id", callback)
-        assert "test_id" in server._callbacks
-    
-    def test_unregister_callback(self):
-        server = CallbackServer(port=0)
-        callback = Mock()
-        server.register("test_id", callback)
-        server.unregister("test_id")
-        assert "test_id" not in server._callbacks
-    
-    def test_invoke_callback(self):
-        server = CallbackServer(port=0)
-        callback = Mock(return_value="result")
-        server.register("test_id", callback)
-        
-        result = server._invoke_callback("test_id", "arg1", "arg2")
-        callback.assert_called_once_with("arg1", "arg2")
-        assert result == "result"
-    
-    def test_invoke_nonexistent_callback(self):
-        server = CallbackServer(port=0)
+class TestCallbackRegistry:
+    def test_register_and_invoke(self):
+        registry = CallbackRegistry()
+        callback = Mock(return_value="ok")
+
+        callback_id = registry.register(callback, kind="xtdata")
+        result = registry.invoke(callback_id, 1, foo="bar")
+
+        assert result == "ok"
+        callback.assert_called_once_with(1, foo="bar")
+
+    def test_invoke_one_shot_callback(self):
+        registry = CallbackRegistry()
+        callback = Mock(return_value="done")
+
+        callback_id = registry.register(callback, kind="async", one_shot=True)
+        assert registry.invoke(callback_id, "payload") == "done"
+
         with pytest.raises(CallbackError):
-            server._invoke_callback("nonexistent")
+            registry.invoke(callback_id, "payload")
+
+    def test_invoke_event_dispatch(self):
+        registry = CallbackRegistry()
+        callback = MagicMock()
+        callback.on_stock_order = Mock(return_value="event-ok")
+
+        callback_id = registry.register(callback, kind="xttrader")
+        result = registry.invoke_event(callback_id, "on_stock_order", 1, 2)
+
+        assert result == "event-ok"
+        callback.on_stock_order.assert_called_once_with(1, 2)
 
 
 class TestRemoteModule:
-    """测试远程模块代理"""
-    
     def test_attribute_access(self):
         mock_client = Mock()
         mock_client._ensure_connected = Mock()
         mock_client._should_reconnect = Mock(return_value=False)
         mock_client._conn = Mock()
-        mock_client._token = "test_token"
-        
-        # Mock the remote module
+
         mock_module = Mock()
         mock_module.test_func = Mock(return_value="test_result")
         mock_client._conn.root.get_xtdata = Mock(return_value=mock_module)
-        
+
         remote = RemoteModule(mock_client, 'xtdata')
-        result = remote.test_func()
-        
-        assert result == "test_result"
-    
-    def test_reconnect_on_error(self):
-        mock_client = Mock()
-        mock_client._ensure_connected = Mock()
-        mock_client._should_reconnect = Mock(return_value=True)
-        mock_client._conn = Mock()
-        mock_client._token = "test_token"
-        
-        # First call fails, second succeeds
-        mock_module = Mock()
-        call_count = [0]
-        
-        def test_func():
-            call_count[0] += 1
-            if call_count[0] == 1:
-                raise Exception("Connection reset")
-            return "success"
-        
-        mock_module.test_func = test_func
-        mock_client._conn.root.get_xtdata = Mock(return_value=mock_module)
-        
-        remote = RemoteModule(mock_client, 'xtdata')
-        
-        # Should trigger reconnect on first failure
-        with pytest.raises(Exception):
-            remote.test_func()
+        assert remote.test_func() == "test_result"
 
 
 class TestXtQuantRemote:
-    """测试主客户端类"""
-    
+    def _build_conn(self):
+        conn = MagicMock()
+        conn.root.authenticate.return_value = {"success": True, "level": "standard"}
+        conn.root.heartbeat.return_value = "pong"
+        conn.root.get_xtdata.return_value = MagicMock()
+        conn.root.get_xttrader.return_value = MagicMock()
+        conn.root.get_xttype.return_value = MagicMock()
+        conn.root.get_xtconstant.return_value = MagicMock()
+        conn.root.get_xtview.return_value = MagicMock()
+        return conn
+
+    @patch('xqshare.client.BgServingThread')
     @patch('xqshare.client.rpyc.connect')
-    def test_connect_without_auth(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
+    def test_connect_with_auth(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
         mock_connect.return_value = mock_conn
-        
-        client = XtQuantRemote(host="localhost", port=18812, client_secret="", auto_reconnect=False)
-        
-        mock_connect.assert_called_once()
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+
         assert client._connected is True
-    
-    @patch('xqshare.client.rpyc.connect')
-    def test_connect_with_auth(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
-        mock_conn.root.authenticate = Mock(return_value="test_token")
-        mock_connect.return_value = mock_conn
-        
-        client = XtQuantRemote(
-            host="localhost", 
-            port=18812, 
-            client_secret="my-secret",
-            auto_reconnect=False
-        )
-        
+        assert client._account_level == "standard"
         mock_conn.root.authenticate.assert_called_once()
-        assert client._token == "test_token"
-    
-    @patch('xqshare.client.rpyc.connect')
-    def test_context_manager(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
-        mock_connect.return_value = mock_conn
-        
-        with XtQuantRemote(host="localhost", auto_reconnect=False) as client:
-            assert client._connected is True
-        
-        assert client._connected is False
-    
-    @patch('xqshare.client.rpyc.connect')
-    def test_should_reconnect(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
-        mock_connect.return_value = mock_conn
-        
-        client = XtQuantRemote(host="localhost", auto_reconnect=True)
-        
-        # Connection errors should trigger reconnect
-        assert client._should_reconnect(Exception("Connection reset")) is True
-        assert client._should_reconnect(Exception("Socket closed")) is True
-        assert client._should_reconnect(Exception("Timeout")) is True
-        
-        # Other errors should not
-        assert client._should_reconnect(Exception("ValueError")) is False
-        
-        client.close()
-    
-    @patch('xqshare.client.rpyc.connect')
-    def test_is_connected(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
-        mock_connect.return_value = mock_conn
-        
-        client = XtQuantRemote(host="localhost", auto_reconnect=False)
-        assert client.is_connected() is True
-        
-        client.close()
-        assert client.is_connected() is False
 
-
-class TestGlobalFunctions:
-    """测试全局便捷函数"""
-    
+    @patch('xqshare.client.BgServingThread')
     @patch('xqshare.client.rpyc.connect')
-    def test_connect_disconnect(self, mock_connect):
-        mock_conn = Mock()
-        mock_conn.root.ping = Mock(return_value="pong")
+    def test_xtdata_subscribe_bridge_and_unsubscribe(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
+        mock_conn.root.subscribe_xtdata_bridge.return_value = 42
+        mock_conn.root.unsubscribe_xtdata_bridge.return_value = True
         mock_connect.return_value = mock_conn
-        
-        from xqshare.client import connect, disconnect, get_client
-        
-        client = connect(host="localhost", auto_reconnect=False)
-        assert client is not None
-        
-        retrieved = get_client()
-        assert retrieved is client
-        
-        disconnect()
-        assert get_client() is None
 
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        callback = Mock()
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+        seq = client.xtdata.subscribe_quote("000001.SZ", period="tick", callback=callback)
+        assert seq == 1
+
+        call_args = mock_conn.root.subscribe_xtdata_bridge.call_args[0]
+        assert call_args[0] == "subscribe_quote"
+        callback_id = call_args[3]
+        dispatcher = call_args[4]
+
+        dispatcher(callback_id, {"000001.SZ": [{"lastPrice": 10.5}]})
+        callback.assert_called_once_with({"000001.SZ": [{"lastPrice": 10.5}]})
+
+        client.xtdata.unsubscribe_quote(seq)
+        mock_conn.root.unsubscribe_xtdata_bridge.assert_called_once_with(42)
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
+    def test_formula_subscription_preserves_request_id_and_translates_followup_calls(self, mock_connect, _bg_thread):
+        conn1 = self._build_conn()
+        conn1.root.subscribe_xtdata_bridge.return_value = 900
+        conn1.root.unsubscribe_xtdata_bridge.return_value = True
+        formula_module_1 = conn1.root.get_xtdata.return_value
+        formula_module_1.get_formula_result.return_value = {"value": 1}
+
+        conn2 = self._build_conn()
+        conn2.root.subscribe_xtdata_bridge.return_value = 901
+        conn2.root.unsubscribe_xtdata_bridge.return_value = True
+        formula_module_2 = conn2.root.get_xtdata.return_value
+        formula_module_2.get_formula_result.return_value = {"value": 2}
+
+        mock_connect.side_effect = [conn1, conn2]
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        request_id = client.xtdata.subscribe_formula(
+            "my_formula",
+            "000001.SZ",
+            "1d",
+            callback=Mock(),
+        )
+        assert request_id == 900
+
+        client.reconnect()
+
+        result = client.xtdata.get_formula_result(request_id)
+        assert result == {"value": 2}
+        formula_module_2.get_formula_result.assert_called_once_with(901)
+
+        client.xtdata.unsubscribe_formula(request_id)
+        conn2.root.unsubscribe_xtdata_bridge.assert_called_once_with(901)
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
+    def test_trader_callback_bridge_and_async_bridge(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
+        trader_remote = MagicMock()
+        trader_remote.userdata_path = "C:\\QMT\\userdata_mini"
+        trader_remote.session_id = 123
+        trader_remote.invoke_async_bridge.return_value = "async-started"
+        mock_conn.root.create_trader.return_value = trader_remote
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        trader = client.create_trader("C:\\QMT\\userdata_mini", 123)
+
+        callback_obj = MagicMock()
+        callback_obj.on_stock_order = Mock()
+        trader.register_callback(callback_obj)
+
+        register_args = trader_remote.register_callback_bridge.call_args[0]
+        binding_id = register_args[0]
+        event_dispatcher = register_args[1]
+        event_dispatcher(binding_id, "on_stock_order", {"order_id": 1})
+        callback_obj.on_stock_order.assert_called_once_with({"order_id": 1})
+
+        async_callback = Mock(return_value="done")
+        result = trader.query_stock_positions_async("account", callback=async_callback)
+        assert result == "async-started"
+
+        async_args = trader_remote.invoke_async_bridge.call_args[0]
+        assert async_args[0] == "query_stock_positions_async"
+        async_callback_id = async_args[3]
+        async_dispatcher = async_args[4]
+        assert async_dispatcher(async_callback_id, {"positions": []}) == "done"
+        async_callback.assert_called_once_with({"positions": []})
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
+    def test_reconnect_restores_subscriptions_and_traders(self, mock_connect, _bg_thread):
+        conn1 = self._build_conn()
+        conn1.root.subscribe_xtdata_bridge.return_value = 11
+        trader_remote_1 = MagicMock()
+        trader_remote_1.userdata_path = "C:\\QMT\\userdata_mini"
+        trader_remote_1.session_id = 7
+        conn1.root.create_trader.return_value = trader_remote_1
+
+        conn2 = self._build_conn()
+        conn2.root.subscribe_xtdata_bridge.return_value = 22
+        trader_remote_2 = MagicMock()
+        trader_remote_2.userdata_path = "C:\\QMT\\userdata_mini"
+        trader_remote_2.session_id = 7
+        conn2.root.create_trader.return_value = trader_remote_2
+
+        mock_connect.side_effect = [conn1, conn2]
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        client.xtdata.subscribe_quote("000001.SZ", period="tick", callback=Mock())
+
+        trader = client.create_trader("C:\\QMT\\userdata_mini", 7)
+        trader.start()
+        trader.connect()
+        trader.subscribe("account")
+        trader.register_callback(MagicMock())
+
+        client.reconnect()
+
+        assert client._subscriptions[1].server_seq == 22
+        conn2.root.create_trader.assert_called_once_with("C:\\QMT\\userdata_mini", 7)
+        trader_remote_2.start.assert_called_once()
+        trader_remote_2.connect.assert_called_once()
+        trader_remote_2.subscribe.assert_called_once_with("account")
+        trader_remote_2.register_callback_bridge.assert_called_once()

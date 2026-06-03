@@ -57,7 +57,7 @@ class TestIntegration:
         ) as client:
             status = client.get_service_status()
             assert "uptime" in status
-            assert "active_tokens" in status
+            assert "active_callbacks" in status
 
 
 if __name__ == "__main__":
