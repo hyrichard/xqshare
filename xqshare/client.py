@@ -79,6 +79,11 @@ def _is_callback_debug_enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _get_callback_debug_value() -> str:
+    """返回 callback 调试环境变量的原始值。"""
+    return os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
+
+
 def _summarize_callback_value(value: Any, max_len: int = 120) -> str:
     """生成回调参数摘要，避免把大对象完整写入日志。"""
     try:
@@ -594,12 +599,23 @@ class XtQuantRemote:
         self._subscription_lock = threading.RLock()
         self._next_client_seq = 1
         self._trader_states: List[TraderModuleState] = []
+        self._callback_debug_enabled = _is_callback_debug_enabled()
+        self._callback_debug_value = _get_callback_debug_value()
 
         self._xtdata = RemoteModule(self, 'xtdata')
         self._xttrader = RemoteModule(self, 'xttrader')
         self._xttype = RemoteModule(self, 'xttype')
         self._xtconstant = RemoteModule(self, 'xtconstant')
         self._xtview = RemoteModule(self, 'xtview')
+
+        self._logger.info(
+            "客户端初始化 | host=%s | port=%s | callback_debug=%s | XQSHARE_DEBUG_CALLBACK=%r | env_file=%r",
+            self._host,
+            self._port,
+            self._callback_debug_enabled,
+            self._callback_debug_value,
+            env_file,
+        )
 
         self._connect()
 
