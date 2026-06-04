@@ -79,6 +79,28 @@ class TestTraderBridge:
         assert adapter.on_stock_order({"order_id": 1}) == "ok"
         dispatcher.assert_called_once_with("binding1", "on_stock_order", {"order_id": 1})
 
+    def test_register_callback_bridge_dispatches_async_order_response(self):
+        trader = MagicMock()
+        dispatcher = Mock(return_value="ok")
+        manager = CallbackManager()
+        bridge = TraderBridge(trader, "path", 1, lambda: "client1", None, None, manager)
+
+        bridge.register_callback_bridge("binding1", dispatcher)
+        adapter = trader.register_callback.call_args[0][0]
+        assert adapter.on_order_stock_async_response({"seq": 1}) == "ok"
+        dispatcher.assert_called_once_with("binding1", "on_order_stock_async_response", {"seq": 1})
+
+    def test_register_callback_bridge_falls_back_for_other_on_events(self):
+        trader = MagicMock()
+        dispatcher = Mock(return_value="ok")
+        manager = CallbackManager()
+        bridge = TraderBridge(trader, "path", 1, lambda: "client1", None, None, manager)
+
+        bridge.register_callback_bridge("binding1", dispatcher)
+        adapter = trader.register_callback.call_args[0][0]
+        assert adapter.on_stock_asset({"cash": 1}) == "ok"
+        dispatcher.assert_called_once_with("binding1", "on_stock_asset", {"cash": 1})
+
     def test_invoke_async_bridge_wraps_callback(self):
         trader = MagicMock()
         trader.query_stock_positions_async.return_value = "started"

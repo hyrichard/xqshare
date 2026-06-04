@@ -474,23 +474,53 @@ class CallbackManager:
 
 
 class TraderCallbackAdapter(XtQuantTraderCallbackBase):
-    """将 xttrader 回调转发到客户端。"""
+    """将 xttrader 交易回调显式转发到客户端。
+
+    优先显式实现常见交易推送入口，尽量贴近 xtquant 官方示例和本地工作形态；
+    同时保留对未显式覆盖 `on_*` 的兜底转发，避免回调面收缩。
+    """
 
     def __init__(self, binding_id: str, callback_manager: CallbackManager):
         self._binding_id = binding_id
         self._callback_manager = callback_manager
 
+    def _forward_event(self, event_name: str, *args, **kwargs):
+        """统一记录并转发交易事件。"""
+        if _is_callback_debug_enabled():
+            _log_callback_debug(
+                "EVENT_RECV",
+                callback_id=self._binding_id,
+                event=event_name,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
+        return self._callback_manager.invoke_event(self._binding_id, event_name, *args, **kwargs)
+
+    def on_disconnected(self):
+        return self._forward_event("on_disconnected")
+
+    def on_account_status(self, status):
+        return self._forward_event("on_account_status", status)
+
+    def on_stock_order(self, order):
+        return self._forward_event("on_stock_order", order)
+
+    def on_stock_trade(self, trade):
+        return self._forward_event("on_stock_trade", trade)
+
+    def on_order_error(self, order_error):
+        return self._forward_event("on_order_error", order_error)
+
+    def on_cancel_error(self, cancel_error):
+        return self._forward_event("on_cancel_error", cancel_error)
+
+    def on_order_stock_async_response(self, response):
+        return self._forward_event("on_order_stock_async_response", response)
+
     def __getattr__(self, name):
+        """兜底转发未显式声明的 `on_*` 交易回调。"""
         if name.startswith("on_"):
             def handler(*args, **kwargs):
-                if _is_callback_debug_enabled():
-                    _log_callback_debug(
-                        "EVENT_RECV",
-                        callback_id=self._binding_id,
-                        event=name,
-                        payload=_summarize_callback_payload(args, kwargs),
-                    )
-                return self._callback_manager.invoke_event(self._binding_id, name, *args, **kwargs)
+                return self._forward_event(name, *args, **kwargs)
             return handler
         raise AttributeError(name)
 
