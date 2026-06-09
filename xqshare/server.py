@@ -538,6 +538,13 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
         """兜底转发未显式声明的 `on_*` 交易回调。"""
         if name.startswith("on_"):
             def handler(*args, **kwargs):
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        "EVENT_FALLBACK",
+                        callback_id=self._binding_id,
+                        event=name,
+                        payload=_summarize_callback_payload(args, kwargs),
+                    )
                 return self._forward_event(name, *args, **kwargs)
             return handler
         raise AttributeError(name)

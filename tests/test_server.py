@@ -101,6 +101,30 @@ class TestTraderBridge:
         assert adapter.on_stock_asset({"cash": 1}) == "ok"
         dispatcher.assert_called_once_with("binding1", "on_stock_asset", {"cash": 1})
 
+    @patch("xqshare.server._is_callback_debug_enabled", return_value=True)
+    @patch("xqshare.server._log_callback_debug")
+    def test_register_callback_bridge_logs_fallback_method_name(
+        self,
+        mock_log_callback_debug,
+        _mock_debug_enabled,
+    ):
+        trader = MagicMock()
+        dispatcher = Mock(return_value="ok")
+        manager = CallbackManager()
+        bridge = TraderBridge(trader, "path", 1, lambda: "client1", None, None, manager)
+
+        bridge.register_callback_bridge("binding1", dispatcher)
+        adapter = trader.register_callback.call_args[0][0]
+        assert adapter.on_unknown_event({"value": 1}) == "ok"
+
+        mock_log_callback_debug.assert_any_call(
+            "EVENT_FALLBACK",
+            callback_id="binding1",
+            event="on_unknown_event",
+            payload="args=dict[1 keys:value]",
+        )
+        dispatcher.assert_called_once_with("binding1", "on_unknown_event", {"value": 1})
+
     @pytest.mark.parametrize(
         ("method_name", "payload"),
         [
