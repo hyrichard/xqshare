@@ -498,14 +498,23 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
     def on_disconnected(self):
         return self._forward_event("on_disconnected")
 
+    def on_connected(self):
+        return self._forward_event("on_connected")
+
     def on_account_status(self, status):
         return self._forward_event("on_account_status", status)
+
+    def on_stock_asset(self, asset):
+        return self._forward_event("on_stock_asset", asset)
 
     def on_stock_order(self, order):
         return self._forward_event("on_stock_order", order)
 
     def on_stock_trade(self, trade):
         return self._forward_event("on_stock_trade", trade)
+
+    def on_stock_position(self, position):
+        return self._forward_event("on_stock_position", position)
 
     def on_order_error(self, order_error):
         return self._forward_event("on_order_error", order_error)
@@ -515,6 +524,15 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
 
     def on_order_stock_async_response(self, response):
         return self._forward_event("on_order_stock_async_response", response)
+
+    def on_cancel_order_stock_async_response(self, response):
+        return self._forward_event("on_cancel_order_stock_async_response", response)
+
+    def on_smt_appointment_async_response(self, response):
+        return self._forward_event("on_smt_appointment_async_response", response)
+
+    def on_bank_transfer_async_response(self, response):
+        return self._forward_event("on_bank_transfer_async_response", response)
 
     def __getattr__(self, name):
         """兜底转发未显式声明的 `on_*` 交易回调。"""

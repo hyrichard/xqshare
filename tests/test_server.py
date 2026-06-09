@@ -101,6 +101,30 @@ class TestTraderBridge:
         assert adapter.on_stock_asset({"cash": 1}) == "ok"
         dispatcher.assert_called_once_with("binding1", "on_stock_asset", {"cash": 1})
 
+    @pytest.mark.parametrize(
+        ("method_name", "payload"),
+        [
+            ("on_connected", ()),
+            ("on_stock_asset", ({"cash": 1},)),
+            ("on_stock_position", ({"stock_code": "000001.SZ"},)),
+            ("on_cancel_order_stock_async_response", ({"seq": 2},)),
+            ("on_smt_appointment_async_response", ({"seq": 3},)),
+            ("on_bank_transfer_async_response", ({"seq": 4},)),
+        ],
+    )
+    def test_register_callback_bridge_dispatches_remaining_documented_events(self, method_name, payload):
+        trader = MagicMock()
+        dispatcher = Mock(return_value="ok")
+        manager = CallbackManager()
+        bridge = TraderBridge(trader, "path", 1, lambda: "client1", None, None, manager)
+
+        bridge.register_callback_bridge("binding1", dispatcher)
+        adapter = trader.register_callback.call_args[0][0]
+        method = getattr(adapter, method_name)
+
+        assert method(*payload) == "ok"
+        dispatcher.assert_called_once_with("binding1", method_name, *payload)
+
     def test_invoke_async_bridge_wraps_callback(self):
         trader = MagicMock()
         trader.query_stock_positions_async.return_value = "started"
