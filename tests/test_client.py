@@ -163,6 +163,51 @@ class TestXtQuantRemote:
 
     @patch('xqshare.client.BgServingThread')
     @patch('xqshare.client.rpyc.connect')
+    def test_formula_unsubscribe_accepts_request_id_keyword(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
+        mock_conn.root.subscribe_xtdata_bridge.return_value = 900
+        mock_conn.root.unsubscribe_xtdata_bridge.return_value = True
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        request_id = client.xtdata.subscribe_formula(
+            "my_formula",
+            "000001.SZ",
+            "1d",
+            callback=Mock(),
+        )
+
+        result = client.xtdata.unsubscribe_formula(request_id=request_id)
+        assert result is True
+        mock_conn.root.unsubscribe_xtdata_bridge.assert_called_once_with(900)
+        assert request_id not in client._subscriptions
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
+    def test_xtdata_subscribe_queue_bridge_preserves_trailing_kwargs(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
+        mock_conn.root.subscribe_xtdata_bridge.return_value = 43
+        mock_conn.root.unsubscribe_xtdata_bridge.return_value = True
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        callback = Mock(return_value=None)
+
+        seq = client.xtdata.subscribe_l2thousand_queue("000001.SZ", callback, 2, 11.3)
+        assert seq == 1
+
+        call_args = mock_conn.root.subscribe_xtdata_bridge.call_args[0]
+        assert call_args[0] == "subscribe_l2thousand_queue"
+        assert call_args[1] == ("000001.SZ",)
+        assert call_args[2] == {"gear_num": 2, "price": 11.3}
+
+        callback_id = call_args[3]
+        dispatcher = call_args[4]
+        assert dispatcher(callback_id, {"000001.SZ": [{"lastPrice": 9.9}]}) is None
+        callback.assert_called_once_with({"000001.SZ": [{"lastPrice": 9.9}]})
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
     def test_trader_callback_bridge_and_async_bridge(self, mock_connect, _bg_thread):
         mock_conn = self._build_conn()
         trader_remote = MagicMock()
@@ -195,6 +240,34 @@ class TestXtQuantRemote:
         async_dispatcher = async_args[4]
         assert async_dispatcher(async_callback_id, {"positions": []}) == "done"
         async_callback.assert_called_once_with({"positions": []})
+
+    @patch('xqshare.client.BgServingThread')
+    @patch('xqshare.client.rpyc.connect')
+    def test_trader_async_bridge_preserves_optional_args_after_callback(self, mock_connect, _bg_thread):
+        mock_conn = self._build_conn()
+        trader_remote = MagicMock()
+        trader_remote.userdata_path = "C:\\QMT\\userdata_mini"
+        trader_remote.session_id = 123
+        trader_remote.invoke_async_bridge.return_value = "async-started"
+        mock_conn.root.create_trader.return_value = trader_remote
+        mock_connect.return_value = mock_conn
+
+        client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
+        trader = client.create_trader("C:\\QMT\\userdata_mini", 123)
+
+        async_callback = Mock(return_value="done")
+        result = trader.query_stock_orders_async("account", async_callback, False)
+        assert result == "async-started"
+
+        async_args = trader_remote.invoke_async_bridge.call_args[0]
+        assert async_args[0] == "query_stock_orders_async"
+        assert async_args[1] == ("account",)
+        assert async_args[2] == {"cancelable_only": False}
+
+        async_callback_id = async_args[3]
+        async_dispatcher = async_args[4]
+        assert async_dispatcher(async_callback_id, {"orders": []}) == "done"
+        async_callback.assert_called_once_with({"orders": []})
 
     @patch('xqshare.client.BgServingThread')
     @patch('xqshare.client.rpyc.connect')

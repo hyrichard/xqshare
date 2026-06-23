@@ -22,6 +22,11 @@ DEFAULT_CLIENT_SECRET = "xqshare-default-secret"
 SERIALIZED_MARKER = "__xqshare_serialized__"
 FORMULA_SUBSCRIBE_METHODS = {"subscribe_formula"}
 FORMULA_REQUEST_METHODS = {"get_formula_result", "bind_formula", "unsubscribe_formula"}
+# 少数 callback 不在末尾的接口，需要按原始签名重建参数，避免位置参数错位。
+CALLBACK_SIGNATURE_HINTS = {
+    ("xtdata", "subscribe_l2thousand_queue"): ("stock_code", "callback", "gear_num", "price"),
+    ("xttrader", "query_stock_orders_async"): ("account", "callback", "cancelable_only"),
+}
 
 
 # ==================== 日志配置 ====================
@@ -438,7 +443,12 @@ class RemoteModule:
         def wrapper(*args, **kwargs):
             if self._module_name == "xtdata":
                 if func_name.startswith("subscribe"):
-                    callback, _, _ = self._client._extract_callback(args, kwargs)
+                    callback, _, _ = self._client._extract_callback(
+                        args,
+                        kwargs,
+                        module_name=self._module_name,
+                        method_name=func_name,
+                    )
                     if callback is not None:
                         return self._client._call_xtdata_subscribe(func_name, args, kwargs)
                 if func_name.startswith("unsubscribe"):
@@ -450,7 +460,12 @@ class RemoteModule:
                 if func_name == "register_callback":
                     return self._client._call_trader_register_callback(self, args, kwargs)
                 if func_name.endswith("_async"):
-                    callback, _, _ = self._client._extract_callback(args, kwargs)
+                    callback, _, _ = self._client._extract_callback(
+                        args,
+                        kwargs,
+                        module_name=self._module_name,
+                        method_name=func_name,
+                    )
                     if callback is not None:
                         return self._client._call_trader_async(self, func_name, args, kwargs)
 
@@ -773,7 +788,8 @@ class XtQuantRemote:
             self._next_client_seq = seq + 1
             return seq
 
-    def _extract_callback(self, args, kwargs, object_mode: bool = False):
+    def _extract_callback(self, args, kwargs, object_mode: bool = False,
+                          module_name: Optional[str] = None, method_name: Optional[str] = None):
         args = tuple(args)
         kwargs = dict(kwargs)
 
@@ -785,6 +801,28 @@ class XtQuantRemote:
             if args:
                 return args[0], args[1:], kwargs
             return None, args, kwargs
+
+        if module_name and method_name:
+            signature = CALLBACK_SIGNATURE_HINTS.get((module_name, method_name))
+            if signature is not None:
+                callback_index = signature.index("callback")
+                values = {}
+                for index, param_name in enumerate(signature):
+                    if index < len(args):
+                        values[param_name] = args[index]
+                values.update(kwargs)
+
+                callback = values.get("callback")
+                if callable(callback):
+                    values.pop("callback", None)
+                    args_wo_cb = tuple(values[param_name] for param_name in signature[:callback_index]
+                                       if param_name in values)
+                    kwargs_wo_cb = {
+                        param_name: values[param_name]
+                        for param_name in signature[callback_index + 1:]
+                        if param_name in values
+                    }
+                    return callback, args_wo_cb, kwargs_wo_cb
 
         if args and callable(args[-1]):
             return args[-1], args[:-1], kwargs
@@ -866,7 +904,12 @@ class XtQuantRemote:
             raise
 
     def _call_xtdata_subscribe(self, method_name: str, args, kwargs):
-        callback, args_wo_cb, kwargs_wo_cb = self._extract_callback(args, kwargs)
+        callback, args_wo_cb, kwargs_wo_cb = self._extract_callback(
+            args,
+            kwargs,
+            module_name="xtdata",
+            method_name=method_name,
+        )
         if callback is None:
             module = self._xtdata._ensure_module()
             return getattr(module, method_name)(*args, **kwargs)
@@ -910,6 +953,8 @@ class XtQuantRemote:
 
     def _call_xtdata_unsubscribe(self, func_name: str, func, args, kwargs):
         seq = kwargs.get("seq")
+        if seq is None:
+            seq = kwargs.get("request_id")
         if seq is None and args:
             seq = args[0]
         if seq is None:
@@ -980,7 +1025,12 @@ class XtQuantRemote:
             raise
 
     def _call_trader_async(self, trader_module: RemoteModule, method_name: str, args, kwargs):
-        callback, args_wo_cb, kwargs_wo_cb = self._extract_callback(args, kwargs)
+        callback, args_wo_cb, kwargs_wo_cb = self._extract_callback(
+            args,
+            kwargs,
+            module_name="xttrader",
+            method_name=method_name,
+        )
         if callback is None:
             remote = trader_module._ensure_module()
             return getattr(remote, method_name)(*args, **kwargs)
