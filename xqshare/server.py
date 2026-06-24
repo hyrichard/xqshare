@@ -21,6 +21,7 @@ from .auth import (
     PermissionError,
     get_permission_checker,
 )
+from .paper_trader import PAPER_TRADER_MODE_ENV, PaperXtQuantTrader, is_paper_trader_mode
 
 # Import xtquant (only available on Windows)
 try:
@@ -847,19 +848,34 @@ class XtQuantService(rpyc.Service):
         if error:
             logger.warning(f"[权限拒绝] create_xttrader | client={self._client_info} | {error}")
             raise error
-        if not XTQUANT_AVAILABLE:
-            raise RuntimeError("xtquant 库未安装")
-
-        if userdata_path is None:
-            userdata_path = os.environ.get("QMT_USERDATA_PATH")
-        if userdata_path is None:
-            raise ValueError("必须提供 userdata_path 参数或设置 QMT_USERDATA_PATH 环境变量")
 
         if session_id is None:
             session_id = int(time.time())
 
-        trader = XtQuantTrader(userdata_path, session_id)
-        logger.info(f"[创建Trader] userdata_path={userdata_path} | session_id={session_id}")
+        trader_mode = os.environ.get(PAPER_TRADER_MODE_ENV, "real").strip().lower()
+        if trader_mode == "paper":
+            trader = PaperXtQuantTrader.from_env(
+                userdata_path,
+                session_id,
+                xtdata_module=self._xtdata,
+                xtconstant_module=self._xtconstant,
+            )
+            logger.info(
+                "[创建Trader] mode=paper | userdata_path=%s | session_id=%s",
+                userdata_path,
+                session_id,
+            )
+        else:
+            if not XTQUANT_AVAILABLE:
+                raise RuntimeError("xtquant 库未安装")
+
+            if userdata_path is None:
+                userdata_path = os.environ.get("QMT_USERDATA_PATH")
+            if userdata_path is None:
+                raise ValueError("必须提供 userdata_path 参数或设置 QMT_USERDATA_PATH 环境变量")
+
+            trader = XtQuantTrader(userdata_path, session_id)
+            logger.info(f"[创建Trader] mode=real | userdata_path={userdata_path} | session_id={session_id}")
         return TraderBridge(
             trader,
             userdata_path,
@@ -1036,6 +1052,7 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
     print(f"  监听地址: {host}:{port}")
     print(f"  SSL 加密: {'启用' if use_ssl else '禁用'}")
     print(f"  日志级别: {log_level}")
+    print(f"  交易后端: {'纸面交易' if is_paper_trader_mode() else '真实柜台'}")
     print(f"  Callback调试: {'启用' if callback_debug_enabled else '关闭'} "
           f"(XQSHARE_DEBUG_CALLBACK={callback_debug_value!r})")
     print("=" * 70)

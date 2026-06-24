@@ -178,6 +178,20 @@ export QMT_USERDATA_PATH="C:\\QMT\\userdata_mini"
 python examples/query_positions.py
 ```
 
+**纸面交易模式（用于非交易时段联调）:**
+```bash
+# 只替换 xttrader，xtdata 仍然走真实数据
+export XQSHARE_TRADER_MODE=paper
+
+# 可选：初始化账户现金和持仓
+export XQSHARE_PAPER_TRADER_SEED='{"cash": 1000000, "positions": {"000001.SZ": {"volume": 100, "avg_price": 10.0}}}'
+
+# 可选：控制分笔成交的节奏，便于复现“部分成交中撤单”
+export XQSHARE_PAPER_TRADER_FILL_INTERVAL_SECONDS=0.05
+```
+
+纸面交易当前只模拟 `stock_buy` / `stock_sell`，支持部分成交、撤单竞态，以及资金/持仓/委托/成交查询；下单后会先冻结资金或可用持仓，避免并发委托重复占用。
+
 **备选：命令行参数（覆盖环境变量）:**
 ```bash
 # 显式指定服务端地址
