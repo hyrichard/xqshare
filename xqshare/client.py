@@ -118,8 +118,6 @@ def _summarize_callback_payload(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -
 
 def _log_callback_debug(logger_obj: logging.Logger, phase: str, **fields: Any) -> None:
     """输出统一格式的 callback 调试日志。"""
-    if not _is_callback_debug_enabled():
-        return
 
     payload = {
         "thread": threading.current_thread().name,
@@ -261,47 +259,42 @@ class CallbackRegistry:
         if binding is None or not binding.active:
             raise CallbackError(f"回调不存在或已失效: {callback_id}")
 
-        debug_enabled = _is_callback_debug_enabled()
         callback_name = None
-        start_time = None
-        if debug_enabled:
-            callback_name = getattr(binding.callback, "__name__", binding.callback.__class__.__name__)
-            start_time = time.perf_counter()
+        callback_name = getattr(binding.callback, "__name__", binding.callback.__class__.__name__)
+        start_time = time.perf_counter()
+        _log_callback_debug(
+            self._logger,
+            "USER_CB_START",
+            callback_id=callback_id,
+            kind=binding.kind,
+            handler=callback_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
+        try:
+            result = binding.callback(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
             _log_callback_debug(
                 self._logger,
-                "USER_CB_START",
+                "USER_CB_DONE",
                 callback_id=callback_id,
                 kind=binding.kind,
                 handler=callback_name,
-                payload=_summarize_callback_payload(args, kwargs),
+                cost_ms=f"{elapsed_ms:.2f}",
+                result=_summarize_callback_value(result),
             )
-        try:
-            result = binding.callback(*args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "USER_CB_DONE",
-                    callback_id=callback_id,
-                    kind=binding.kind,
-                    handler=callback_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
             return result
         except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "USER_CB_ERROR",
-                    callback_id=callback_id,
-                    kind=binding.kind,
-                    handler=callback_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            _log_callback_debug(
+                self._logger,
+                "USER_CB_ERROR",
+                callback_id=callback_id,
+                kind=binding.kind,
+                handler=callback_name,
+                cost_ms=f"{elapsed_ms:.2f}",
+                error=type(exc).__name__,
+                message=str(exc)[:200],
+            )
             raise
         finally:
             if binding.one_shot:
@@ -318,50 +311,45 @@ class CallbackRegistry:
             self._logger.debug(f"忽略未实现的交易回调: {event_name} | binding={callback_id}")
             return None
 
-        debug_enabled = _is_callback_debug_enabled()
         handler_name = None
-        start_time = None
-        if debug_enabled:
-            handler_name = f"{binding.callback.__class__.__name__}.{event_name}"
-            start_time = time.perf_counter()
+        handler_name = f"{binding.callback.__class__.__name__}.{event_name}"
+        start_time = time.perf_counter()
+        _log_callback_debug(
+            self._logger,
+            "USER_CB_START",
+            callback_id=callback_id,
+            kind=binding.kind,
+            event=event_name,
+            handler=handler_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
+        try:
+            result = handler(*args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
             _log_callback_debug(
                 self._logger,
-                "USER_CB_START",
+                "USER_CB_DONE",
                 callback_id=callback_id,
                 kind=binding.kind,
                 event=event_name,
                 handler=handler_name,
-                payload=_summarize_callback_payload(args, kwargs),
+                cost_ms=f"{elapsed_ms:.2f}",
+                result=_summarize_callback_value(result),
             )
-        try:
-            result = handler(*args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "USER_CB_DONE",
-                    callback_id=callback_id,
-                    kind=binding.kind,
-                    event=event_name,
-                    handler=handler_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
             return result
         except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "USER_CB_ERROR",
-                    callback_id=callback_id,
-                    kind=binding.kind,
-                    event=event_name,
-                    handler=handler_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            _log_callback_debug(
+                self._logger,
+                "USER_CB_ERROR",
+                callback_id=callback_id,
+                kind=binding.kind,
+                event=event_name,
+                handler=handler_name,
+                cost_ms=f"{elapsed_ms:.2f}",
+                error=type(exc).__name__,
+                message=str(exc)[:200],
+            )
             raise
 
     def list_active(self):
@@ -613,7 +601,6 @@ class XtQuantRemote:
         self._subscription_lock = threading.RLock()
         self._next_client_seq = 1
         self._trader_states: List[TraderModuleState] = []
-        self._callback_debug_enabled = True
 
         self._xtdata = RemoteModule(self, 'xtdata')
         self._xttrader = RemoteModule(self, 'xttrader')
@@ -622,11 +609,11 @@ class XtQuantRemote:
         self._xtview = RemoteModule(self, 'xtview')
 
         self._logger.info(
-            "客户端初始化 | version=%s | host=%s | port=%s | callback_debug=%s | env_file=%r",
+            "客户端初始化 | version=%s | host=%s | port=%s | env_file=%r",
             XQSHARE_VERSION,
             self._host,
             self._port,
-            self._callback_debug_enabled,
+            
             env_file,
         )
 
@@ -794,36 +781,33 @@ class XtQuantRemote:
                     continue
 
                 kind, callback_id, event_name, args, kwargs = task
-                if _is_callback_debug_enabled():
-                    _log_callback_debug(
-                        self._logger,
-                        "WORKER_BEGIN",
-                        kind=kind,
-                        callback_id=callback_id,
-                        event=event_name,
-                    )
+                _log_callback_debug(
+                    self._logger,
+                    "WORKER_BEGIN",
+                    kind=kind,
+                    callback_id=callback_id,
+                    event=event_name,
+                )
                 if kind == "event":
                     self._callback_registry.invoke_event(callback_id, event_name, *args, **kwargs)
                 else:
                     self._callback_registry.invoke(callback_id, *args, **kwargs)
-                if _is_callback_debug_enabled():
-                    _log_callback_debug(
-                        self._logger,
-                        "WORKER_DONE",
-                        kind=kind,
-                        callback_id=callback_id,
-                        event=event_name,
-                    )
+                _log_callback_debug(
+                    self._logger,
+                    "WORKER_DONE",
+                    kind=kind,
+                    callback_id=callback_id,
+                    event=event_name,
+                )
             except Exception as exc:
-                if _is_callback_debug_enabled():
-                    _log_callback_debug(
-                        self._logger,
-                        "WORKER_ERROR",
-                        kind=kind,
-                        callback_id=callback_id,
-                        event=event_name,
-                        error=type(exc).__name__,
-                    )
+                _log_callback_debug(
+                    self._logger,
+                    "WORKER_ERROR",
+                    kind=kind,
+                    callback_id=callback_id,
+                    event=event_name,
+                    error=type(exc).__name__,
+                )
                 self._logger.exception(
                     "异步回调执行失败 | kind=%s | callback_id=%s | event=%s | error=%s",
                     kind,
@@ -845,24 +829,22 @@ class XtQuantRemote:
         """将回调转交给后台线程，避免阻塞 RPyC 的服务调用。"""
 
         if self._stop_callback_worker.is_set():
-            if _is_callback_debug_enabled():
-                _log_callback_debug(
-                    self._logger,
-                    "QUEUE_REJECT",
-                    kind=kind,
-                    callback_id=callback_id,
-                    event=event_name,
-                )
-            return None
-
-        if _is_callback_debug_enabled():
             _log_callback_debug(
                 self._logger,
-                "QUEUE_PUT",
+                "QUEUE_REJECT",
+                kind=kind,
                 callback_id=callback_id,
                 event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
             )
+            return None
+
+        _log_callback_debug(
+            self._logger,
+            "QUEUE_PUT",
+            callback_id=callback_id,
+            event=event_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
         self._callback_queue.put((kind, callback_id, event_name, tuple(args), dict(kwargs)))
         return None
 
@@ -942,26 +924,22 @@ class XtQuantRemote:
         return None, args, kwargs
 
     def _dispatch_callback(self, callback_id: str, *args, **kwargs):
-        debug_enabled = _is_callback_debug_enabled()
-        if debug_enabled:
-            _log_callback_debug(
-                self._logger,
-                "DISPATCH_RECV",
-                callback_id=callback_id,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
+        _log_callback_debug(
+            self._logger,
+            "DISPATCH_RECV",
+            callback_id=callback_id,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
         return self._queue_callback_task("callback", callback_id, args, kwargs)
 
     def _dispatch_trader_event(self, binding_id: str, event_name: str, *args, **kwargs):
-        debug_enabled = _is_callback_debug_enabled()
-        if debug_enabled:
-            _log_callback_debug(
-                self._logger,
-                "DISPATCH_RECV",
-                callback_id=binding_id,
-                event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
+        _log_callback_debug(
+            self._logger,
+            "DISPATCH_RECV",
+            callback_id=binding_id,
+            event=event_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
         return self._queue_callback_task("event", binding_id, args, kwargs, event_name=event_name)
 
     def _call_xtdata_subscribe(self, method_name: str, args, kwargs):
@@ -1106,16 +1084,15 @@ class XtQuantRemote:
 
         remote = trader_module._ensure_module()
         try:
-            if _is_callback_debug_enabled():
-                _log_callback_debug(
-                    self._logger,
-                    "ASYNC_REGISTER",
-                    callback_id=callback_id,
-                    kind="xttrader_async",
-                    method=method_name,
-                    payload=_summarize_callback_payload(tuple(args_wo_cb), kwargs_wo_cb),
-                    session_id=getattr(trader_module._trader_state, "session_id", None),
-                )
+            _log_callback_debug(
+                self._logger,
+                "ASYNC_REGISTER",
+                callback_id=callback_id,
+                kind="xttrader_async",
+                method=method_name,
+                payload=_summarize_callback_payload(tuple(args_wo_cb), kwargs_wo_cb),
+                session_id=getattr(trader_module._trader_state, "session_id", None),
+            )
             return remote.invoke_async_bridge(
                 method_name,
                 args_wo_cb,

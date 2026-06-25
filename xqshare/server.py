@@ -154,15 +154,13 @@ def _summarize_callback_payload(args: tuple, kwargs: Dict[str, Any]) -> str:
 
 def _log_callback_debug(phase: str, **fields: Any) -> None:
     """输出统一格式的 callback 调试日志。"""
-    if not _is_callback_debug_enabled():
-        return
 
     payload = {
         "thread": threading.current_thread().name,
         **fields,
     }
     message = " ".join(f"{key}={value}" for key, value in payload.items() if value is not None)
-    _get_logger().info(f"[CB][SERVER][{phase}] {message}")
+    api_logger.info(f"[CB][SERVER][{phase}] {message}")
 
 
 # ==================== 日志装饰器 ====================
@@ -359,42 +357,37 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
+        start_time = time.perf_counter()
+        _log_callback_debug(
+            "FORWARD_START",
+            callback_id=binding_id,
+            kind=info.kind,
+            client=info.client_info,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
+        try:
+            result = info.dispatcher(binding_id, *args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
             _log_callback_debug(
-                "FORWARD_START",
+                "FORWARD_DONE",
                 callback_id=binding_id,
                 kind=info.kind,
                 client=info.client_info,
-                payload=_summarize_callback_payload(args, kwargs),
+                cost_ms=f"{elapsed_ms:.2f}",
+                result=_summarize_callback_value(result),
             )
-        try:
-            result = info.dispatcher(binding_id, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_DONE",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
             return result
         except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_ERROR",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            _log_callback_debug(
+                "FORWARD_ERROR",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                cost_ms=f"{elapsed_ms:.2f}",
+                error=type(exc).__name__,
+                message=str(exc)[:200],
+            )
             raise
         finally:
             if info.one_shot:
@@ -407,45 +400,40 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
+        start_time = time.perf_counter()
+        _log_callback_debug(
+            "FORWARD_START",
+            callback_id=binding_id,
+            kind=info.kind,
+            client=info.client_info,
+            event=event_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
+        try:
+            result = info.dispatcher(binding_id, event_name, *args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
             _log_callback_debug(
-                "FORWARD_START",
+                "FORWARD_DONE",
                 callback_id=binding_id,
                 kind=info.kind,
                 client=info.client_info,
                 event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
+                cost_ms=f"{elapsed_ms:.2f}",
+                result=_summarize_callback_value(result),
             )
-        try:
-            result = info.dispatcher(binding_id, event_name, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_DONE",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
             return result
         except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_ERROR",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            _log_callback_debug(
+                "FORWARD_ERROR",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                event=event_name,
+                cost_ms=f"{elapsed_ms:.2f}",
+                error=type(exc).__name__,
+                message=str(exc)[:200],
+            )
             raise
 
     def list_callbacks(self):
@@ -482,13 +470,12 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
 
     def _forward_event(self, event_name: str, *args, **kwargs):
         """统一记录并转发交易事件。"""
-        if _is_callback_debug_enabled():
-            _log_callback_debug(
-                "EVENT_RECV",
-                callback_id=self._binding_id,
-                event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
+        _log_callback_debug(
+            "EVENT_RECV",
+            callback_id=self._binding_id,
+            event=event_name,
+            payload=_summarize_callback_payload(args, kwargs),
+        )
         return self._callback_manager.invoke_event(self._binding_id, event_name, *args, **kwargs)
 
     def on_disconnected(self):
@@ -534,13 +521,12 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
         """兜底转发未显式声明的 `on_*` 交易回调。"""
         if name.startswith("on_"):
             def handler(*args, **kwargs):
-                if _is_callback_debug_enabled():
-                    _log_callback_debug(
-                        "EVENT_FALLBACK",
-                        callback_id=self._binding_id,
-                        event=name,
-                        payload=_summarize_callback_payload(args, kwargs),
-                    )
+                _log_callback_debug(
+                    "EVENT_FALLBACK",
+                    callback_id=self._binding_id,
+                    event=name,
+                    payload=_summarize_callback_payload(args, kwargs),
+                )
                 return self._forward_event(name, *args, **kwargs)
             return handler
         raise AttributeError(name)
@@ -705,19 +691,18 @@ class TraderBridge:
             client=self._client_info_getter(),
             method=method_name,
             session_id=self.session_id,
-            payload=_summarize_callback_payload(tuple(args), dict(kwargs)) if _is_callback_debug_enabled() else None,
+            payload=_summarize_callback_payload(tuple(args), dict(kwargs)) if True else None,
         )
 
         def on_result(*cb_args, **cb_kwargs):
-            if _is_callback_debug_enabled():
-                _log_callback_debug(
-                    "ASYNC_RESULT_RECV",
-                    callback_id=callback_id,
-                    kind="xttrader_async",
-                    client=self._client_info_getter(),
-                    method=method_name,
-                    payload=_summarize_callback_payload(cb_args, cb_kwargs),
-                )
+            _log_callback_debug(
+                "ASYNC_RESULT_RECV",
+                callback_id=callback_id,
+                kind="xttrader_async",
+                client=self._client_info_getter(),
+                method=method_name,
+                payload=_summarize_callback_payload(cb_args, cb_kwargs),
+            )
             return self._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
 
         method = getattr(self._trader, method_name)
@@ -1101,7 +1086,6 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
 
     _init_logging(log_level)
     XtQuantService._start_time = time.time()
-    callback_debug_enabled = _is_callback_debug_enabled()
 
     print("=" * 70)
     print("  XtQuant Share (xqshare) 服务")
@@ -1119,7 +1103,7 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
 
     logger.info(
         f"服务启动 | version={XQSHARE_VERSION} | host={host} | port={port} | ssl={use_ssl} | "
-        f"callback_debug={callback_debug_enabled} | env_file={env_file!r}"
+        f"env_file={env_file!r}"
     )
 
     config = {
