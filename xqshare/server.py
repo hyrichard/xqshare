@@ -832,6 +832,8 @@ class TraderBridge:
             "unsubscribe": self._paper_unsubscribe,
             "subscribe_account": self._paper_subscribe,
             "unsubscribe_account": self._paper_unsubscribe,
+            "register_callback": self._paper_register_callback,
+            "set_callback": self._paper_register_callback,
             "order_stock": self._paper_order_stock,
             "order_stock_async": self._paper_order_stock_async,
             "cancel_order_stock": self._paper_cancel_order_stock,
@@ -861,6 +863,15 @@ class TraderBridge:
             "query_new_purchase_limit": self._paper_unsupported_dict,
         }
         return paper_methods.get(name)
+
+    def _paper_register_callback(self, callback=None) -> int:
+        """纸面交易 register_callback：空操作。
+
+        回调已在 register_callback_bridge 阶段通过 CallbackManager 桥接完成，
+        这里只兼容本地模式直接调用 register_callback 的场景。
+        """
+        logger.info("[纸面交易] register_callback | session_id=%s", self.session_id)
+        return 0
 
     def _paper_start(self, *args, **kwargs) -> int:
         """纸面交易 start：标记会话启动。"""
