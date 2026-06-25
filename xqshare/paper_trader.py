@@ -729,50 +729,27 @@ class PaperSimulator:
         return order_id, events
 
     def cancel_order_stock(self, account: Any, order_id: int) -> tuple[int, list[PaperEvent]]:
-        """提交撤单请求，返回 (cancel_result, events)。"""
+        """提交撤单请求，返回 (cancel_result, events)。
+
+        模拟真实柜台行为：撤单请求只做校验和标记，不立即改变订单状态。
+        撤单结果（成功或失败）由 ticker 异步推进并推送 on_cancel_error / on_stock_order。
+        """
         account_state, _ = self._get_or_create_account_state(account)
-        events: list[PaperEvent] = []
         with self._lock:
             order_state = account_state.orders.get(_as_int(order_id, -1))
             if order_state is None:
-                cancel_error = PaperCancelError(
-                    account_type=account_state.account_type,
-                    account_id=account_state.account_id,
-                    order_id=_as_int(order_id, -1),
-                    market=0,
-                    order_sysid="",
-                    error_id=DEFAULT_CANCEL_ERROR_ID,
-                    error_msg="未找到可撤销的委托。",
-                    order_status=0,
-                )
-                events.append(PaperEvent("on_cancel_error", cancel_error))
-                return -1, events
+                # 订单不存在：同步返回 -1，不推送 cancel_error（真实柜台也查询不到时当即报错）
+                return -1, []
 
             if order_state.order_status in self._constants.terminal_order_statuses:
-                cancel_error = PaperCancelError(
-                    account_type=account_state.account_type,
-                    account_id=account_state.account_id,
-                    order_id=order_state.order_id,
-                    market=0,
-                    order_sysid=order_state.order_sysid,
-                    error_id=DEFAULT_CANCEL_ERROR_ID,
-                    error_msg="委托已进入终态，无法撤单。",
-                    order_status=order_state.order_status,
-                )
-                events.append(PaperEvent("on_cancel_error", cancel_error))
-                return -1, events
+                # 已终态：同步返回 -1，对应真实柜台本地校验失败
+                return -1, []
 
+            # 标记撤单请求已提交，状态和事件由 ticker 异步推进
             order_state.cancel_requested = True
-            if order_state.traded_volume > 0:
-                order_state.order_status = self._constants.order_partsucc_cancel
-                order_state.status_msg = "部成待撤"
-            else:
-                order_state.order_status = self._constants.order_reported_cancel
-                order_state.status_msg = "已报待撤"
-            order_snapshot = self._build_order_snapshot_locked(order_state)
 
-        events.append(PaperEvent("on_stock_order", order_snapshot))
-        return 0, events
+        # 返回 0 表示撤单请求已提交，与真实柜台 cancel_result=0 语义一致
+        return 0, []
 
     def cancel_order_stock_sysid(self, account: Any, market: Any, sysid: str) -> tuple[int, list[PaperEvent]]:
         """按系统委托编号撤单。"""
@@ -1470,26 +1447,53 @@ class PaperSimulator:
         return trade_state
 
     def _apply_cancel_locked(self, account_state: _AccountState, order_state: _OrderState) -> list[PaperEvent]:
-        """在持锁状态下应用撤单，释放冻结资源并返回事件。"""
+        """在持锁状态下应用撤单，返回事件列表。
+
+        模拟真实柜台异步撤单的两种结果：
+        - 已全部成交 → 撤单被拒，推送 on_cancel_error + 终态 on_stock_order(56)
+        - 尚未全部成交 → 撤单成功，释放资源，推送终态 on_stock_order(53 部撤 或 54 已撤)
+        """
+        events: list[PaperEvent] = []
+        remaining_volume = max(order_state.order_volume - order_state.traded_volume, 0)
+
+        # 如果已经全部成交，撤单被柜台拒绝，与真实 on_cancel_error 一致
+        if remaining_volume <= 0:
+            order_state.cancel_requested = False
+            cancel_error = PaperCancelError(
+                account_type=account_state.account_type,
+                account_id=account_state.account_id,
+                order_id=order_state.order_id,
+                market=0,
+                order_sysid=order_state.order_sysid,
+                error_id=DEFAULT_CANCEL_ERROR_ID,
+                error_msg="委托已全部成交，无法撤单。",
+                order_status=order_state.order_status,
+            )
+            events.append(PaperEvent("on_cancel_error", cancel_error))
+            # 保序推送终态订单快照
+            events.append(PaperEvent("on_stock_order", self._build_order_snapshot_locked(order_state)))
+            return events
+
+        # 撤单成功：更新状态并释放冻结资源
         if order_state.traded_volume > 0:
             order_state.order_status = self._constants.order_part_cancel
             order_state.status_msg = "部撤"
         else:
             order_state.order_status = self._constants.order_canceled
             order_state.status_msg = "已撤"
+
         if order_state.order_type == self._constants.stock_buy:
-            remaining_volume = max(order_state.order_volume - order_state.traded_volume, 0)
             remaining_cash = round(remaining_volume * order_state.price, 2)
             self._release_buy_cash_locked(account_state, remaining_cash)
         else:
             position_state = account_state.positions.get(order_state.stock_code)
             if position_state is not None:
-                remaining_volume = max(order_state.order_volume - order_state.traded_volume, 0)
                 self._release_sell_volume_locked(position_state, remaining_volume)
                 if position_state.volume <= 0 and position_state.frozen_volume <= 0:
                     account_state.positions.pop(order_state.stock_code, None)
-        order_snapshot = self._build_order_snapshot_locked(order_state)
-        return [PaperEvent("on_stock_order", order_snapshot)]
+
+        events.append(PaperEvent("on_stock_order", self._build_order_snapshot_locked(order_state)))
+        return events
 
     def _create_trade_state_locked(
         self,

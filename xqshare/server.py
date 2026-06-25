@@ -950,9 +950,13 @@ class TraderBridge:
         return order_id
 
     def _paper_cancel_order_stock(self, account, order_id) -> int:
-        """纸面交易撤单。"""
-        cancel_result, events = self._paper.cancel_order_stock(account, order_id)
-        self._emit_paper_events(events)
+        """纸面交易撤单。
+
+        模拟真实柜台：撤单请求只做校验和标记，不推送事件。
+        撤单结果由 ticker 异步推进并通过 on_cancel_error / on_stock_order 回调到达。
+        """
+        cancel_result, _events = self._paper.cancel_order_stock(account, order_id)
+        # 事件不再由 cancel_order_stock 产生，由 paper-ticker 异步推进时推送
         return cancel_result
 
     def _paper_cancel_order_stock_async(self, account, order_id, callback=None) -> int:
@@ -974,9 +978,11 @@ class TraderBridge:
         return cancel_result
 
     def _paper_cancel_order_stock_sysid(self, account, market, sysid) -> int:
-        """纸面交易按系统编号撤单。"""
-        cancel_result, events = self._paper.cancel_order_stock_sysid(account, market, sysid)
-        self._emit_paper_events(events)
+        """纸面交易按系统编号撤单。
+
+        与 _paper_cancel_order_stock 一致，只做校验标记，事件由 ticker 异步推送。
+        """
+        cancel_result, _events = self._paper.cancel_order_stock_sysid(account, market, sysid)
         return cancel_result
 
     def _paper_cancel_order_stock_sysid_async(self, account, market, sysid, callback=None) -> int:
