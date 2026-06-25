@@ -823,7 +823,11 @@ class PaperSimulator:
                 order_snapshot = self._build_order_snapshot_locked(order_state)
                 return [PaperEvent("on_stock_order", order_snapshot)]
 
-            fill_volume = self._build_next_fill_volume(remaining_volume)
+            round_index = order_state.trade_count + 1
+            if self._last_fill_round(round_index):
+                fill_volume = remaining_volume
+            else:
+                fill_volume = self._build_next_fill_volume(remaining_volume)
             if fill_volume <= 0:
                 order_state.order_status = self._constants.order_junk
                 order_state.status_msg = "废单"
@@ -831,18 +835,13 @@ class PaperSimulator:
                 return [PaperEvent("on_stock_order", order_snapshot)]
 
             trade_state = self._apply_fill_locked(account_state, order_state, fill_volume)
-            order_snapshot = self._build_order_snapshot_locked(order_state)
             trade_snapshot = self._build_trade_snapshot_locked(trade_state)
-            asset_snapshot = self._build_asset_snapshot_locked(account_state)
-            position_snapshot = self._build_position_snapshot_after_fill_locked(account_state, order_state.stock_code)
+            order_snapshot = self._build_order_snapshot_locked(order_state)
 
         events = [
             PaperEvent("on_stock_trade", trade_snapshot),
             PaperEvent("on_stock_order", order_snapshot),
-            PaperEvent("on_stock_asset", asset_snapshot),
         ]
-        if position_snapshot is not None:
-            events.append(PaperEvent("on_stock_position", position_snapshot))
         return events
 
     def is_order_active(self, account_key: tuple[str, str], order_id: int) -> bool:
@@ -1388,6 +1387,13 @@ class PaperSimulator:
             PaperEvent("on_stock_order", order_snapshot),
         ]
 
+    # 单笔订单最多撮合次数，超过后剩余数量一次性成交。
+    _MAX_FILL_ROUNDS = 4
+
+    def _last_fill_round(self, round_index: int) -> bool:
+        """判断当前是否为最后一轮撮合。"""
+        return round_index >= self._MAX_FILL_ROUNDS
+
     def _build_next_fill_volume(self, remaining_volume: int) -> int:
         """把剩余数量拆成一个可观测的部分成交切片。"""
         if remaining_volume <= 1:
@@ -1518,22 +1524,3 @@ class PaperSimulator:
             instrument_name=order_state.instrument_name,
         )
 
-    def _build_position_snapshot_after_fill_locked(
-        self,
-        account_state: _AccountState,
-        stock_code: str,
-    ) -> PaperPosition | None:
-        """在成交后构造受影响持仓的快照。"""
-        position_state = account_state.positions.get(stock_code)
-        if position_state is None:
-            return PaperPosition(
-                account_type=account_state.account_type,
-                account_id=account_state.account_id,
-                stock_code=stock_code,
-                volume=0, can_use_volume=0, open_price=0.0, market_value=0.0,
-                frozen_volume=0, on_road_volume=0, yesterday_volume=0,
-                avg_price=0.0, direction=0, last_price=0.0, profit_rate=0.0,
-                secu_account=account_state.account_id,
-                instrument_name=self._resolve_instrument_name(stock_code),
-            )
-        return self._build_position_snapshot_locked(account_state, position_state)
