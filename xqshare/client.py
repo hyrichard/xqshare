@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import rpyc
 from rpyc.utils.helpers import BgServingThread
+from . import __version__ as XQSHARE_VERSION
 
 # 默认客户端配置（与服务端保持一致）
 DEFAULT_CLIENT_ID = "client-standard"
@@ -80,14 +81,8 @@ def get_logger():
 
 
 def _is_callback_debug_enabled() -> bool:
-    """判断是否开启 callback 调试日志。"""
-    value = os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_callback_debug_value() -> str:
-    """返回 callback 调试环境变量的原始值。"""
-    return os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
+    """默认开启 callback 调试日志。"""
+    return True
 
 
 def _summarize_callback_value(value: Any, max_len: int = 120) -> str:
@@ -618,8 +613,7 @@ class XtQuantRemote:
         self._subscription_lock = threading.RLock()
         self._next_client_seq = 1
         self._trader_states: List[TraderModuleState] = []
-        self._callback_debug_enabled = _is_callback_debug_enabled()
-        self._callback_debug_value = _get_callback_debug_value()
+        self._callback_debug_enabled = True
 
         self._xtdata = RemoteModule(self, 'xtdata')
         self._xttrader = RemoteModule(self, 'xttrader')
@@ -628,11 +622,11 @@ class XtQuantRemote:
         self._xtview = RemoteModule(self, 'xtview')
 
         self._logger.info(
-            "客户端初始化 | host=%s | port=%s | callback_debug=%s | XQSHARE_DEBUG_CALLBACK=%r | env_file=%r",
+            "客户端初始化 | version=%s | host=%s | port=%s | callback_debug=%s | env_file=%r",
+            XQSHARE_VERSION,
             self._host,
             self._port,
             self._callback_debug_enabled,
-            self._callback_debug_value,
             env_file,
         )
 
@@ -699,7 +693,7 @@ class XtQuantRemote:
             if self._heartbeat_interval > 0:
                 self._start_heartbeat()
 
-            self._logger.info(f"连接成功: {self._host}:{self._port}")
+            self._logger.info(f"连接成功: {self._host}:{self._port} | version={XQSHARE_VERSION}")
         except Exception as e:
             self._connected = False
             raise ConnectionError(f"连接失败: {e}")
@@ -775,7 +769,11 @@ class XtQuantRemote:
             name="xqshare-callback-worker",
         )
         self._callback_worker_thread.start()
-        self._logger.info("回调派发 worker 已启动: thread=%s", self._callback_worker_thread.name)
+        self._logger.info(
+            "回调派发 worker 已启动: version=%s thread=%s",
+            XQSHARE_VERSION,
+            self._callback_worker_thread.name,
+        )
 
     def _callback_worker_loop(self):
         """串行执行回调任务，确保服务器线程能尽快返回。"""

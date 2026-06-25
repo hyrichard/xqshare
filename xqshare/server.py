@@ -16,6 +16,7 @@ from typing import Any, Dict, Optional
 import rpyc
 from rpyc.utils.server import ThreadedServer
 
+from . import __version__ as XQSHARE_VERSION
 from .auth import (
     AccountLevel,
     PermissionError,
@@ -111,14 +112,8 @@ def _init_logging(log_level="INFO"):
 
 
 def _is_callback_debug_enabled() -> bool:
-    """判断是否开启 callback 调试日志。"""
-    value = os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_callback_debug_value() -> str:
-    """返回 callback 调试环境变量的原始值。"""
-    return os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
+    """默认开启 callback 调试日志。"""
+    return True
 
 
 def _get_logger() -> logging.Logger:
@@ -1106,27 +1101,25 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
 
     _init_logging(log_level)
     XtQuantService._start_time = time.time()
-    callback_debug_value = _get_callback_debug_value()
     callback_debug_enabled = _is_callback_debug_enabled()
 
     print("=" * 70)
     print("  XtQuant Share (xqshare) 服务")
+    print(f"  版本号: {XQSHARE_VERSION}")
     print("=" * 70)
     print(f"  监听地址: {host}:{port}")
     print(f"  SSL 加密: {'启用' if use_ssl else '禁用'}")
     print(f"  日志级别: {log_level}")
     print(f"  交易后端: {'纸面交易' if is_paper_trader_mode() else '真实柜台'}")
-    print(f"  Callback调试: {'启用' if callback_debug_enabled else '关闭'} "
-          f"(XQSHARE_DEBUG_CALLBACK={callback_debug_value!r})")
+    print("  Callback调试: 启用")
     print("=" * 70)
 
     if XtQuantService._permission_checker is None:
         XtQuantService._permission_checker = get_permission_checker()
 
     logger.info(
-        f"服务启动 | host={host} | port={port} | ssl={use_ssl} | "
-        f"callback_debug={callback_debug_enabled} | "
-        f"XQSHARE_DEBUG_CALLBACK={callback_debug_value!r} | env_file={env_file!r}"
+        f"服务启动 | version={XQSHARE_VERSION} | host={host} | port={port} | ssl={use_ssl} | "
+        f"callback_debug={callback_debug_enabled} | env_file={env_file!r}"
     )
 
     config = {
