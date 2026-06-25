@@ -644,20 +644,27 @@ class TraderBridge:
         return self._paper is not None
 
     def _emit_paper_events(self, events: list) -> None:
-        """通过 CallbackManager 派发纸面交易事件，与真实柜台回调走同一条链路。"""
+        """通过 CallbackManager 派发纸面交易事件。
+
+        对齐 xtquant 的 executor.submit(callback, data) 机制：
+        提交到 PaperSimulator 的单线程池执行，不等待返回。
+        当线程池被之前的推送占住时，后续推送和 cancel 响应排队。
+        """
         if not events or self._callback_adapter is None:
             return
+        executor = self._paper._ensure_executor()
         for event in events:
             handler = getattr(self._callback_adapter, event.event_name, None)
             if callable(handler):
-                try:
-                    handler(event.data)
-                except Exception:
-                    logger.exception(
-                        "[纸面交易] 回调派发异常 | event=%s | session_id=%s",
-                        event.event_name,
-                        self.session_id,
-                    )
+                executor.submit(self._do_emit_paper_event, handler, event)
+
+    @staticmethod
+    def _do_emit_paper_event(handler, event) -> None:
+        """在 executor 线程中执行单个纸面交易事件推送。"""
+        try:
+            handler(event.data)
+        except Exception:
+            logger.exception("[纸面交易] 回调派发异常 | event=%s", event.event_name)
 
     def _start_paper_ticker(self) -> None:
         """启动纸面交易撮合推进线程。"""
@@ -950,72 +957,24 @@ class TraderBridge:
         return order_id
 
     def _paper_cancel_order_stock(self, account, order_id) -> int:
-        """纸面交易撤单。
+        """纸面交易撤单，委托给 PaperSimulator 处理。"""
+        return self._paper.cancel_order_stock_with_sync(account, order_id, self._emit_paper_events)
 
-        模拟真实柜台卡单：撤单请求提交后，同步推进订单的所有撮合轮次直到终态，
-        每轮产生的成交事件和最终的撤单结果事件都在 cancel_order_stock 的 RPC
-        调用返回前通过 RPyC 推送。这些推送与 RPC 返回值共享同一条 RPyC 连接，
-        当客户端 callback worker 串行消费积压时，cancel_order_stock 的返回值
-        被堵塞在连接层，复现真实卡单现象。
-        """
-        cancel_result, _events = self._paper.cancel_order_stock(account, order_id)
-        # 同步推送柜台当场拒绝的事件
-        sync_reject_events = self._paper.cancel_order_stock_sync_check(account, order_id)
-        self._emit_paper_events(sync_reject_events)
-        # 撤单请求已提交（cancel_result == 0），同步推进订单所有撮合轮次直到终态，
-        # 将所有成交事件和撤单结果事件在 RPC 返回前推送出去
-        if cancel_result == 0:
-            account_key = self._paper._get_account_key(account)
-            while self._paper.is_order_active(account_key, order_id):
-                self._paper_ticker_tick()
-        return cancel_result
 
     def _paper_cancel_order_stock_async(self, account, order_id, callback=None) -> int:
-        """纸面交易异步撤单。"""
-        from .paper_trader import PaperCancelOrderResponse
-        cancel_result = self._paper_cancel_order_stock(account, order_id)
-        if callable(callback):
-            account_state = self._paper._get_or_create_account_state(account)[0]
-            order = self._paper.query_stock_order(account, order_id)
-            callback(PaperCancelOrderResponse(
-                account_type=account_state.account_type,
-                account_id=account_state.account_id,
-                cancel_result=cancel_result,
-                order_id=order_id,
-                order_sysid=order.order_sysid if order else "",
-                seq=order_id,
-                error_msg="" if cancel_result == 0 else "撤单失败",
-            ))
-        return cancel_result
+        """纸面交易异步撤单，委托给 PaperSimulator 处理。"""
+        return self._paper.cancel_order_stock_async_with_sync(account, order_id, self._emit_paper_events, callback)
+
 
     def _paper_cancel_order_stock_sysid(self, account, market, sysid) -> int:
-        """纸面交易按系统编号撤单。
+        """纸面交易按系统编号撤单，委托给 PaperSimulator 处理。"""
+        return self._paper.cancel_order_stock_sysid_with_sync(account, market, sysid, self._emit_paper_events)
 
-        与 _paper_cancel_order_stock 一致，同步推进 ticker 推送积压事件。
-        """
-        cancel_result, _events = self._paper.cancel_order_stock_sysid(account, market, sysid)
-        sync_reject_events = self._paper.cancel_order_stock_sysid_sync_check(account, market, sysid)
-        self._emit_paper_events(sync_reject_events)
-        if cancel_result == 0:
-            self._paper_ticker_tick()
-        return cancel_result
 
     def _paper_cancel_order_stock_sysid_async(self, account, market, sysid, callback=None) -> int:
-        """纸面交易按系统编号异步撤单。"""
-        from .paper_trader import PaperCancelOrderResponse
-        cancel_result = self._paper_cancel_order_stock_sysid(account, market, sysid)
-        if callable(callback):
-            account_state = self._paper._get_or_create_account_state(account)[0]
-            callback(PaperCancelOrderResponse(
-                account_type=account_state.account_type,
-                account_id=account_state.account_id,
-                cancel_result=cancel_result,
-                order_id=0,
-                order_sysid=str(sysid),
-                seq=0,
-                error_msg="" if cancel_result == 0 else "撤单失败",
-            ))
-        return cancel_result
+        """纸面交易按系统编号异步撤单，委托给 PaperSimulator 处理。"""
+        return self._paper.cancel_order_stock_sysid_async_with_sync(account, market, sysid, self._emit_paper_events, callback)
+
 
     def _paper_query_stock_asset(self, account):
         """纸面交易查询资金。"""

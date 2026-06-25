@@ -20,6 +20,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Mapping, Optional
+from concurrent.futures import Future, ThreadPoolExecutor
 
 LOGGER = logging.getLogger(__name__)
 
@@ -559,6 +560,10 @@ class PaperSimulator:
         self._accounts: dict[tuple[str, str], _AccountState] = {}
         self._orders_by_sysid: dict[str, tuple[tuple[str, str], int]] = {}
         self._instrument_name_cache: dict[str, str] = {}
+        # 对齐 xtquant 的 ThreadPoolExecutor(max_workers=1) 机制：
+        # 推送回调和 cancel 响应共享同一个单线程池，当推送占住线程时 cancel 阻塞。
+        self._executor: ThreadPoolExecutor | None = None
+        self._cancel_cbs: dict[int, Any] = {}  # seq -> callback
 
     @classmethod
     def from_env(
@@ -595,8 +600,11 @@ class PaperSimulator:
         return self._seed
 
     def stop(self) -> None:
-        """标记模拟器停止，活跃的 tick 调用会尽快退出。"""
+        """标记模拟器停止，关闭 executor 和 tick 循环。"""
         self._stop_event.set()
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
     # ==================== 账户管理 ====================
 
@@ -731,19 +739,19 @@ class PaperSimulator:
     def cancel_order_stock(self, account: Any, order_id: int) -> tuple[int, list[PaperEvent]]:
         """提交撤单请求，返回 (cancel_result, events)。
 
-        模拟真实柜台行为：撤单请求只做校验和标记，不立即改变订单状态。
-        撤单结果（成功或失败）由 ticker 异步推进并推送 on_cancel_error / on_stock_order。
-        如果柜台当场拒绝（订单不存在/已终态），拒绝事件由 cancel_order_stock_sync_check 产生，
-        并由调用方 _paper_cancel_order_stock 同步推送，模拟嵌套在 RPC 调用内的 on_cancel_error。
+        模拟真实柜台行为：始终返回 0 表示撤单请求已提交。
+        撤单被拒（订单不存在/已终态/已全部成交）通过 on_cancel_error 回调通知，
+        不由返回值表达。拒绝事件由 cancel_order_stock_sync_check 产生，
+        由调用方 _paper_cancel_order_stock 在 RPC 返回前同步推送。
         """
         account_state, _ = self._get_or_create_account_state(account)
         with self._lock:
             order_state = account_state.orders.get(_as_int(order_id, -1))
             if order_state is None:
-                return -1, []
+                return 0, []
 
             if order_state.order_status in self._constants.terminal_order_statuses:
-                return -1, []
+                return 0, []
 
             # 标记撤单请求已提交，状态和事件由 ticker 异步推进
             order_state.cancel_requested = True
@@ -790,12 +798,12 @@ class PaperSimulator:
         return []
 
     def cancel_order_stock_sysid(self, account: Any, market: Any, sysid: str) -> tuple[int, list[PaperEvent]]:
-        """按系统委托编号撤单。拒绝事件由 cancel_order_stock_sync_check 产生。"""
+        """按系统委托编号撤单。始终返回 0，拒绝事件由 sync_check 产生。"""
         account_state, _ = self._get_or_create_account_state(account)
         with self._lock:
             entry = self._orders_by_sysid.get(_as_str(sysid))
         if entry is None:
-            return -1, []
+            return 0, []
         _, order_id = entry
         return self.cancel_order_stock(account, order_id)
 
@@ -817,6 +825,134 @@ class PaperSimulator:
             ))]
         _, order_id = entry
         return self.cancel_order_stock_sync_check(account, order_id)
+
+    # ==================== 带同步机制的撤单（对齐 xtquant executor + Future） ====================
+
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        """延迟创建单线程池，对齐 xtquant 的 ThreadPoolExecutor(max_workers=1)。"""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+        return self._executor
+
+    def cancel_order_stock_with_sync(
+        self, account: Any, order_id: int, emit_events: Any,
+    ) -> int:
+        """带同步机制的撤单，对齐 xtquant 的 common_op_sync_with_seq。
+
+        Args:
+            account: 证券账户。
+            order_id: 委托编号。
+            emit_events: 事件派发回调，由 server.py 提供。
+
+        Returns:
+            int: cancel_result。
+        """
+        import random
+        seq = random.randint(100000, 999999)
+        future: Future = Future()
+        self._cancel_cbs[seq] = lambda cancel_result: future.set_result(cancel_result)
+        self._ensure_executor().submit(
+            self._do_cancel_order_stock_sync, account, order_id, emit_events, seq,
+        )
+        return future.result()
+
+    def cancel_order_stock_sysid_with_sync(
+        self, account: Any, market: Any, sysid: str, emit_events: Any,
+    ) -> int:
+        """按系统编号撤单，对齐 xtquant 的 common_op_sync_with_seq。"""
+        import random
+        seq = random.randint(100000, 999999)
+        future: Future = Future()
+        self._cancel_cbs[seq] = lambda cancel_result: future.set_result(cancel_result)
+        self._ensure_executor().submit(
+            self._do_cancel_order_stock_sysid_sync, account, market, sysid, emit_events, seq,
+        )
+        return future.result()
+
+    def cancel_order_stock_async_with_sync(
+        self, account: Any, order_id: int, emit_events: Any, callback: Any = None,
+    ) -> int:
+        """异步撤单，对齐 xtquant 的 cancel_order_stock_async。"""
+        import random
+        seq = random.randint(100000, 999999)
+        self._ensure_executor().submit(
+            self._do_cancel_order_stock_async_sync, account, order_id, emit_events, callback, seq,
+        )
+        return seq
+
+    def cancel_order_stock_sysid_async_with_sync(
+        self, account: Any, market: Any, sysid: str, emit_events: Any, callback: Any = None,
+    ) -> int:
+        """按系统编号异步撤单，对齐 xtquant 的 cancel_order_stock_sysid_async。"""
+        import random
+        seq = random.randint(100000, 999999)
+        self._ensure_executor().submit(
+            self._do_cancel_order_stock_sysid_async_sync, account, market, sysid, emit_events, callback, seq,
+        )
+        return seq
+
+    def _do_cancel_order_stock_sync(
+        self, account: Any, order_id: int, emit_events: Any, seq: int,
+    ) -> None:
+        """在 executor 线程中执行撤单，对齐 xtquant 的 on_common_resp_callback。"""
+        cancel_result, _events = self.cancel_order_stock(account, order_id)
+        sync_reject_events = self.cancel_order_stock_sync_check(account, order_id)
+        emit_events(sync_reject_events)
+        callback = self._cancel_cbs.pop(seq, None)
+        if callback:
+            callback(cancel_result)
+
+    def _do_cancel_order_stock_sysid_sync(
+        self, account: Any, market: Any, sysid: str, emit_events: Any, seq: int,
+    ) -> None:
+        """在 executor 线程中执行按系统编号撤单。"""
+        cancel_result, _events = self.cancel_order_stock_sysid(account, market, sysid)
+        sync_reject_events = self.cancel_order_stock_sysid_sync_check(account, market, sysid)
+        emit_events(sync_reject_events)
+        callback = self._cancel_cbs.pop(seq, None)
+        if callback:
+            callback(cancel_result)
+
+    def _do_cancel_order_stock_async_sync(
+        self, account: Any, order_id: int, emit_events: Any, callback: Any, seq: int,
+    ) -> None:
+        """在 executor 线程中执行异步撤单。"""
+        from .paper_trader import PaperCancelOrderResponse
+        cancel_result, _events = self.cancel_order_stock(account, order_id)
+        sync_reject_events = self.cancel_order_stock_sync_check(account, order_id)
+        emit_events(sync_reject_events)
+        if callable(callback):
+            account_state = self._get_or_create_account_state(account)[0]
+            order = self.query_stock_order(account, order_id)
+            callback(PaperCancelOrderResponse(
+                account_type=account_state.account_type,
+                account_id=account_state.account_id,
+                cancel_result=cancel_result,
+                order_id=order_id,
+                order_sysid=order.order_sysid if order else "",
+                seq=seq,
+                error_msg="" if cancel_result == 0 else "撤单失败",
+            ))
+
+    def _do_cancel_order_stock_sysid_async_sync(
+        self, account: Any, market: Any, sysid: str, emit_events: Any, callback: Any, seq: int,
+    ) -> None:
+        """在 executor 线程中执行按系统编号异步撤单。"""
+        from .paper_trader import PaperCancelOrderResponse
+        cancel_result, _events = self.cancel_order_stock_sysid(account, market, sysid)
+        sync_reject_events = self.cancel_order_stock_sysid_sync_check(account, market, sysid)
+        emit_events(sync_reject_events)
+        if callable(callback):
+            account_state = self._get_or_create_account_state(account)[0]
+            callback(PaperCancelOrderResponse(
+                account_type=account_state.account_type,
+                account_id=account_state.account_id,
+                cancel_result=cancel_result,
+                order_id=0,
+                order_sysid=str(sysid),
+                seq=seq,
+                error_msg="" if cancel_result == 0 else "撤单失败",
+            ))
 
     # ==================== 订单生命周期推进 ====================
 
