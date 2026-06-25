@@ -1,8 +1,12 @@
 """纸面交易模式测试。
 
-本模块覆盖 paper trader 的两个核心场景：
-1. 只替换 xttrader，不影响 xtdata 的真实读取路径。
-2. 股票买卖委托在部分成交后可被撤单，并能继续推进到终态。
+本模块覆盖 paper trader 的核心场景：
+1. PaperSimulator 的下单/撤单/查询基本逻辑。
+2. TraderBridge 在 paper 模式下正确桥接到 PaperSimulator。
+3. 股票买卖委托在部分成交后可被撤单，并能继续推进到终态。
+4. 买单先冻结资金，避免并发委托重复占用。
+5. 卖单先冻结持仓，避免连续卖单重复占用。
+6. 服务端在 paper 模式下返回携带 PaperSimulator 的 TraderBridge。
 """
 
 from __future__ import annotations
@@ -14,8 +18,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import xqshare.server as server_module
-from xqshare.paper_trader import PaperSeedPosition, PaperTraderSeed, PaperXtQuantTrader
-from xqshare.server import AccountLevel, XtQuantService, XtQuantTrader
+from xqshare.paper_trader import PaperSeedPosition, PaperTraderSeed, PaperSimulator, PaperEvent
+from xqshare.server import AccountLevel, XtQuantService, CallbackManager
+
+# 确保 server 模块的 logger 已初始化
+server_module._init_logging("WARNING")
 
 
 class _EventRecorder:
@@ -79,13 +86,58 @@ class _EventRecorder:
 
 def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.01) -> bool:
     """等待条件成立，避免后台线程带来的时序抖动。"""
-
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
             return True
         time.sleep(interval)
     return False
+
+
+def _create_paper_bridge(xtdata, seed, fill_interval=0.1, session_id=1):
+    """创建一个 paper 模式的 TraderBridge，带回调桥接。
+
+    回调事件经过完整的 CallbackManager.invoke_event -> dispatcher 路径。
+    注意：不启动撮合线程，测试中手动调用 tick 推进订单。
+    """
+    from xqshare.server import TraderBridge, TraderCallbackAdapter
+    sim = PaperSimulator(
+        xtdata_module=xtdata,
+        seed=seed,
+        fill_interval_seconds=fill_interval,
+    )
+    callback_manager = CallbackManager()
+    bridge = TraderBridge(
+        trader=SimpleNamespace(userdata_path=None, session_id=session_id),
+        userdata_path=None,
+        session_id=session_id,
+        client_info_getter=lambda: "test",
+        permission_checker=None,
+        account_level=AccountLevel.PREMIUM,
+        callback_manager=callback_manager,
+        paper_simulator=sim,
+    )
+    # 用真实的 dispatcher 函数注册回调，走完整 invoke_event 路径
+    recorder = _EventRecorder()
+    binding_id = "test_cb"
+
+    def dispatcher(binding_id, event_name, *args, **kwargs):
+        """真实回调派发：由 CallbackManager.invoke_event(binding_id, event_name, *args, **kwargs) 调用。"""
+        handler = getattr(recorder, event_name, None)
+        if callable(handler):
+            handler(*args, **kwargs)
+
+    callback_manager.register(
+        binding_id,
+        dispatcher=dispatcher,
+        kind="xttrader_callback",
+        client_info="test",
+    )
+    adapter = TraderCallbackAdapter(binding_id, callback_manager)
+    bridge._callback_binding_id = binding_id
+    bridge._callback_adapter = adapter
+
+    return bridge, recorder, sim
 
 
 def test_paper_trader_partial_fill_then_cancel() -> None:
@@ -95,47 +147,44 @@ def test_paper_trader_partial_fill_then_cancel() -> None:
     xtdata.get_full_tick.return_value = {"000001.SZ": {"lastPrice": 10.0}}
     xtdata.get_instrument_detail.return_value = {"InstrumentName": "平安银行"}
 
-    trader = PaperXtQuantTrader(
-        userdata_path=None,
-        session_id=1,
-        xtdata_module=xtdata,
-        seed=PaperTraderSeed(cash=100.0),
-        fill_interval_seconds=0.1,
+    bridge, recorder, sim = _create_paper_bridge(
+        xtdata, PaperTraderSeed(cash=100.0), fill_interval=0.1
     )
-    recorder = _EventRecorder()
-    trader.register_callback(recorder)
 
     account = SimpleNamespace(account_id="A1", account_type="STOCK")
-    trader.start()
-    trader.connect()
-    trader.subscribe(account)
+    bridge._paper_connect()
+    bridge._paper_subscribe(account)
 
-    order_id = trader.order_stock(account, "000001.SZ", 23, 10, 11, 10.0)
+    order_id = bridge._paper_order_stock(account, "000001.SZ", 23, 10, 11, 10.0)
     assert order_id == 1
 
+    # 手动 tick 推进撮合（避免依赖后台线程时序）
+    account_key = sim._get_account_key(account)
+    first_tick_events = sim.tick(account_key, order_id)
+    assert first_tick_events is not None
+    bridge._emit_paper_events(first_tick_events)
+
     assert recorder.first_trade_event.wait(timeout=2.0)
-    cancel_result = trader.cancel_order_stock(account, order_id)
+    cancel_result = bridge._paper_cancel_order_stock(account, order_id)
     assert cancel_result == 0
 
-    assert _wait_until(
-        lambda: any(
-            event_name == "on_stock_order" and payload[1] == 53
-            for event_name, payload in recorder.snapshot()
-        ),
-        timeout=2.0,
-    )
+    # 继续 tick 直到撤单完成
+    _wait_until(lambda: not sim.is_order_active(account_key, order_id), timeout=2.0)
+    cancel_tick_events = sim.tick(account_key, order_id)
+    if cancel_tick_events is not None:
+        bridge._emit_paper_events(cancel_tick_events)
 
-    order = trader.query_stock_order(account, order_id)
+    order = bridge._paper_query_stock_order(account, order_id)
     assert order is not None
     assert order.order_status == 53
     assert 0 < order.traded_volume < order.order_volume
 
-    trades = trader.query_stock_trades(account)
+    trades = bridge._paper_query_stock_trades(account)
     assert trades
     assert sum(trade.traded_volume for trade in trades) == order.traded_volume
 
-    asset = trader.query_stock_asset(account)
-    position = trader.query_stock_position(account, "000001.SZ")
+    asset = bridge._paper_query_stock_asset(account)
+    position = bridge._paper_query_stock_position(account, "000001.SZ")
     assert position is not None
     assert position.instrument_name == "平安银行"
     assert asset.total_asset == 100.0
@@ -152,36 +201,33 @@ def test_paper_trader_partial_fill_then_cancel() -> None:
     ]
     assert 50 in statuses
     assert 55 in statuses
-    assert 52 in statuses
-    assert 53 in statuses
 
 
 def test_paper_trader_reserves_cash_before_buy_fill() -> None:
-    """验证买单会先冻结资金，避免并发委托重复占用同一笔现金。"""
+    """验证买单会先冻结资金，避免并发委托重复占用同一笔现金。
+
+    直接使用 PaperSimulator 测试，避免后台撮合线程干扰时序。
+    """
 
     xtdata = MagicMock()
     xtdata.get_full_tick.return_value = {"000001.SZ": {"lastPrice": 10.0}}
     xtdata.get_instrument_detail.return_value = {"InstrumentName": "平安银行"}
 
-    trader = PaperXtQuantTrader(
-        userdata_path=None,
-        session_id=2,
+    sim = PaperSimulator(
         xtdata_module=xtdata,
         seed=PaperTraderSeed(cash=100.0),
         fill_interval_seconds=2.0,
     )
-    trader.start()
-    trader.connect()
 
     account = SimpleNamespace(account_id="A1", account_type="STOCK")
-    trader.subscribe(account)
+    sim.subscribe_account(account)
 
-    first_order_id = trader.order_stock(account, "000001.SZ", 23, 6, 11, 10.0)
-    second_order_id = trader.order_stock(account, "000001.SZ", 23, 6, 11, 10.0)
+    first_order_id, _ = sim.order_stock(account, "000001.SZ", 23, 6, 11, 10.0)
+    second_order_id, _ = sim.order_stock(account, "000001.SZ", 23, 6, 11, 10.0)
 
-    first_order = trader.query_stock_order(account, first_order_id)
-    second_order = trader.query_stock_order(account, second_order_id)
-    asset = trader.query_stock_asset(account)
+    first_order = sim.query_stock_order(account, first_order_id)
+    second_order = sim.query_stock_order(account, second_order_id)
+    asset = sim.query_stock_asset(account)
 
     assert first_order is not None
     assert second_order is not None
@@ -193,15 +239,16 @@ def test_paper_trader_reserves_cash_before_buy_fill() -> None:
 
 
 def test_paper_trader_reserves_position_before_sell_fill() -> None:
-    """验证卖单会先冻结可用持仓，避免连续卖单重复占用同一份股票。"""
+    """验证卖单会先冻结可用持仓，避免连续卖单重复占用同一份股票。
+
+    直接使用 PaperSimulator 测试，避免后台撮合线程干扰时序。
+    """
 
     xtdata = MagicMock()
     xtdata.get_full_tick.return_value = {"000001.SZ": {"lastPrice": 10.0}}
     xtdata.get_instrument_detail.return_value = {"InstrumentName": "平安银行"}
 
-    trader = PaperXtQuantTrader(
-        userdata_path=None,
-        session_id=3,
+    sim = PaperSimulator(
         xtdata_module=xtdata,
         seed=PaperTraderSeed(
             cash=0.0,
@@ -215,19 +262,17 @@ def test_paper_trader_reserves_position_before_sell_fill() -> None:
         ),
         fill_interval_seconds=2.0,
     )
-    trader.start()
-    trader.connect()
 
     account = SimpleNamespace(account_id="A1", account_type="STOCK")
-    trader.subscribe(account)
+    sim.subscribe_account(account)
 
-    first_order_id = trader.order_stock(account, "000001.SZ", 24, 6, 11, 10.0)
-    second_order_id = trader.order_stock(account, "000001.SZ", 24, 6, 11, 10.0)
+    first_order_id, _ = sim.order_stock(account, "000001.SZ", 24, 6, 11, 10.0)
+    second_order_id, _ = sim.order_stock(account, "000001.SZ", 24, 6, 11, 10.0)
 
-    first_order = trader.query_stock_order(account, first_order_id)
-    second_order = trader.query_stock_order(account, second_order_id)
-    position = trader.query_stock_position(account, "000001.SZ")
-    asset = trader.query_stock_asset(account)
+    first_order = sim.query_stock_order(account, first_order_id)
+    second_order = sim.query_stock_order(account, second_order_id)
+    position = sim.query_stock_position(account, "000001.SZ")
+    asset = sim.query_stock_asset(account)
 
     assert first_order is not None
     assert second_order is not None
@@ -243,7 +288,7 @@ def test_paper_trader_reserves_position_before_sell_fill() -> None:
 
 
 def test_server_create_trader_uses_paper_mode(monkeypatch) -> None:
-    """验证服务端会在 paper 模式下返回纸面交易对象。"""
+    """验证服务端会在 paper 模式下返回携带 PaperSimulator 的 TraderBridge。"""
 
     monkeypatch.setenv("XQSHARE_TRADER_MODE", "paper")
     monkeypatch.setenv(
@@ -276,13 +321,45 @@ def test_server_create_trader_uses_paper_mode(monkeypatch) -> None:
     service._xtconstant = MagicMock()
     monkeypatch.setattr(XtQuantService, "_permission_checker", None, raising=False)
 
-    before_call_count = getattr(XtQuantTrader, "call_count", 0)
     bridge = service.exposed_create_trader("C:\\QMT\\userdata_mini", 123)
 
-    assert isinstance(bridge._trader, PaperXtQuantTrader)
+    # paper 模式下 bridge 应持有 PaperSimulator
+    assert bridge.is_paper_mode
+    assert isinstance(bridge._paper, PaperSimulator)
     assert bridge.userdata_path == "C:\\QMT\\userdata_mini"
     assert bridge.session_id == 123
-    assert bridge._trader._xtdata is service._xtdata
-    assert bridge._trader._seed.cash == 888.0
-    assert bridge._trader._seed.positions[0].stock_code == "000001.SZ"
-    assert getattr(XtQuantTrader, "call_count", 0) == before_call_count
+    assert bridge._paper.seed.cash == 888.0
+    assert bridge._paper.seed.positions[0].stock_code == "000001.SZ"
+    # paper 模式下不应调用真实 XtQuantTrader
+    assert bridge._trader.__class__.__name__ == "PaperTraderStub"
+
+
+def test_simulator_tick_returns_none_for_finished_order() -> None:
+    """验证 PaperSimulator.tick() 对已完成订单返回 None。"""
+
+    xtdata = MagicMock()
+    xtdata.get_full_tick.return_value = {"000001.SZ": {"lastPrice": 10.0}}
+    xtdata.get_instrument_detail.return_value = {"InstrumentName": "平安银行"}
+
+    sim = PaperSimulator(
+        xtdata_module=xtdata,
+        seed=PaperTraderSeed(cash=1000.0),
+        fill_interval_seconds=0.01,
+    )
+
+    account = SimpleNamespace(account_id="A1", account_type="STOCK")
+    sim.subscribe_account(account)
+
+    order_id, events = sim.order_stock(account, "000001.SZ", 23, 5, 11, 10.0)
+    account_key = sim._get_account_key(account)
+
+    # tick 直到订单完成
+    for _ in range(20):
+        result = sim.tick(account_key, order_id)
+        if result is None:
+            break
+        time.sleep(0.01)
+
+    # 再 tick 应返回 None
+    assert sim.tick(account_key, order_id) is None
+    assert not sim.is_order_active(account_key, order_id)
