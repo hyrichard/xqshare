@@ -733,16 +733,16 @@ class PaperSimulator:
 
         模拟真实柜台行为：撤单请求只做校验和标记，不立即改变订单状态。
         撤单结果（成功或失败）由 ticker 异步推进并推送 on_cancel_error / on_stock_order。
+        如果柜台当场拒绝（订单不存在/已终态），拒绝事件由 cancel_order_stock_sync_check 产生，
+        并由调用方 _paper_cancel_order_stock 同步推送，模拟嵌套在 RPC 调用内的 on_cancel_error。
         """
         account_state, _ = self._get_or_create_account_state(account)
         with self._lock:
             order_state = account_state.orders.get(_as_int(order_id, -1))
             if order_state is None:
-                # 订单不存在：同步返回 -1，不推送 cancel_error（真实柜台也查询不到时当即报错）
                 return -1, []
 
             if order_state.order_status in self._constants.terminal_order_statuses:
-                # 已终态：同步返回 -1，对应真实柜台本地校验失败
                 return -1, []
 
             # 标记撤单请求已提交，状态和事件由 ticker 异步推进
@@ -751,13 +751,61 @@ class PaperSimulator:
         # 返回 0 表示撤单请求已提交，与真实柜台 cancel_result=0 语义一致
         return 0, []
 
+    def cancel_order_stock_sync_check(self, account: Any, order_id: int) -> list[PaperEvent]:
+        """撤单同步校验，返回柜台当场拒绝时产生的 on_cancel_error 事件。
+
+        模拟真实柜台在 cancel_order_stock 调用内部同步推送拒绝回调的行为。
+        只在以下情况返回事件：
+        - 订单不存在 → on_cancel_error（找不到可撤销的委托）
+        - 订单已进入终态 → on_cancel_error（委托已进入终态，无法撤单）
+        订单可撤时返回空列表，拒绝事件由 ticker 异步产生。
+        """
+        account_state, _ = self._get_or_create_account_state(account)
+        with self._lock:
+            order_state = account_state.orders.get(_as_int(order_id, -1))
+            if order_state is None:
+                return [PaperEvent("on_cancel_error", PaperCancelError(
+                    account_type=account_state.account_type,
+                    account_id=account_state.account_id,
+                    order_id=_as_int(order_id, -1),
+                    market=0,
+                    order_sysid="",
+                    error_id=DEFAULT_CANCEL_ERROR_ID,
+                    error_msg="未找到可撤销的委托。",
+                    order_status=0,
+                ))]
+
+            if order_state.order_status in self._constants.terminal_order_statuses:
+                return [PaperEvent("on_cancel_error", PaperCancelError(
+                    account_type=account_state.account_type,
+                    account_id=account_state.account_id,
+                    order_id=order_state.order_id,
+                    market=0,
+                    order_sysid=order_state.order_sysid,
+                    error_id=DEFAULT_CANCEL_ERROR_ID,
+                    error_msg="委托已进入终态，无法撤单。",
+                    order_status=order_state.order_status,
+                ))]
+
+        return []
+
     def cancel_order_stock_sysid(self, account: Any, market: Any, sysid: str) -> tuple[int, list[PaperEvent]]:
-        """按系统委托编号撤单。"""
+        """按系统委托编号撤单。拒绝事件由 cancel_order_stock_sync_check 产生。"""
         account_state, _ = self._get_or_create_account_state(account)
         with self._lock:
             entry = self._orders_by_sysid.get(_as_str(sysid))
         if entry is None:
-            events = [PaperEvent("on_cancel_error", PaperCancelError(
+            return -1, []
+        _, order_id = entry
+        return self.cancel_order_stock(account, order_id)
+
+    def cancel_order_stock_sysid_sync_check(self, account: Any, market: Any, sysid: str) -> list[PaperEvent]:
+        """按系统编号撤单的同步校验，返回拒绝事件。"""
+        account_state, _ = self._get_or_create_account_state(account)
+        with self._lock:
+            entry = self._orders_by_sysid.get(_as_str(sysid))
+        if entry is None:
+            return [PaperEvent("on_cancel_error", PaperCancelError(
                 account_type=account_state.account_type,
                 account_id=account_state.account_id,
                 order_id=0,
@@ -767,9 +815,8 @@ class PaperSimulator:
                 error_msg="未找到可撤销的委托。",
                 order_status=0,
             ))]
-            return -1, events
         _, order_id = entry
-        return self.cancel_order_stock(account, order_id)
+        return self.cancel_order_stock_sync_check(account, order_id)
 
     # ==================== 订单生命周期推进 ====================
 
