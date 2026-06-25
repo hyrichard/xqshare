@@ -646,6 +646,12 @@ class TraderBridge:
 
     def register_callback_bridge(self, binding_id: str, dispatcher):
         self._check("xttrader.register_callback")
+        logger.info(
+            "[回调桥] 开始注册交易回调 | client=%s | session_id=%s | binding_id=%s",
+            self._client_info_getter(),
+            self.session_id,
+            binding_id,
+        )
         self._callback_manager.register(
             binding_id,
             dispatcher,
@@ -663,11 +669,32 @@ class TraderBridge:
             session_id=self.session_id,
         )
         if hasattr(self._trader, "register_callback"):
-            return self._trader.register_callback(self._callback_adapter)
+            result = self._trader.register_callback(self._callback_adapter)
+            logger.info(
+                "[回调桥] 交易回调注册完成 | client=%s | session_id=%s | binding_id=%s | result=%s",
+                self._client_info_getter(),
+                self.session_id,
+                binding_id,
+                _summarize_result(result),
+            )
+            return result
+        logger.info(
+            "[回调桥] 交易回调注册完成 | client=%s | session_id=%s | binding_id=%s | result=None",
+            self._client_info_getter(),
+            self.session_id,
+            binding_id,
+        )
         return None
 
     def invoke_async_bridge(self, method_name: str, args, kwargs, callback_id: str, dispatcher):
         self._check(f"xttrader.{method_name}", tuple(args), dict(kwargs))
+        logger.info(
+            "[异步桥] 开始发起交易异步调用 | client=%s | session_id=%s | method=%s | callback_id=%s",
+            self._client_info_getter(),
+            self.session_id,
+            method_name,
+            callback_id,
+        )
         self._callback_manager.register(
             callback_id,
             dispatcher,
@@ -701,7 +728,16 @@ class TraderBridge:
         method = getattr(self._trader, method_name)
         call_kwargs = dict(kwargs)
         call_kwargs["callback"] = on_result
-        return _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
+        result = _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
+        logger.info(
+            "[异步桥] 交易异步调用已提交 | client=%s | session_id=%s | method=%s | callback_id=%s | result=%s",
+            self._client_info_getter(),
+            self.session_id,
+            method_name,
+            callback_id,
+            _summarize_result(result),
+        )
+        return result
 
     def __getattr__(self, name):
         return getattr(self._proxy, name)
@@ -741,9 +777,11 @@ class XtQuantService(rpyc.Service):
         except Exception:
             self._client_info = "unknown"
         logger.info(f"[连接] 客户端接入: {self._client_info}")
+        logger.info(f"[连接] 会话初始化完成: client={self._client_info}")
 
     def on_disconnect(self, conn):
         client_info = getattr(self, '_client_info', 'unknown')
+        logger.info(f"[断开] 开始清理客户端会话: {client_info}")
         to_remove = [
             server_seq for server_seq, info in list(XtQuantService._xtdata_subscriptions.items())
             if info.get("client_info") == client_info
@@ -876,6 +914,7 @@ class XtQuantService(rpyc.Service):
 
             trader = XtQuantTrader(userdata_path, session_id)
             logger.info(f"[创建Trader] mode=real | userdata_path={userdata_path} | session_id={session_id}")
+        logger.info(f"[创建Trader] 交易对象就绪 | client={self._client_info} | session_id={session_id}")
         return TraderBridge(
             trader,
             userdata_path,
@@ -890,6 +929,12 @@ class XtQuantService(rpyc.Service):
     def exposed_subscribe_xtdata_bridge(self, method_name: str, args: tuple, kwargs: dict,
                                         callback_id: str, dispatcher):
         self._require_auth()
+        logger.info(
+            "[行情桥] 开始订阅 | client=%s | method=%s | callback_id=%s",
+            self._client_info,
+            method_name,
+            callback_id,
+        )
 
         full_name = f"xtdata.{method_name}"
         permission_kwargs = dict(kwargs)
@@ -922,6 +967,13 @@ class XtQuantService(rpyc.Service):
                 "method_name": method_name,
                 "unsubscribe_method": _get_xtdata_unsubscribe_method(method_name),
             }
+            logger.info(
+                "[行情桥] 订阅完成 | client=%s | method=%s | callback_id=%s | server_seq=%s",
+                self._client_info,
+                method_name,
+                callback_id,
+                server_seq,
+            )
             return server_seq
         except Exception:
             XtQuantService._callback_manager.unregister(callback_id)
@@ -930,6 +982,11 @@ class XtQuantService(rpyc.Service):
     @log_api_call("unsubscribe_xtdata_bridge")
     def exposed_unsubscribe_xtdata_bridge(self, server_seq):
         self._require_auth()
+        logger.info(
+            "[行情桥] 开始退订 | client=%s | server_seq=%s",
+            self._client_info,
+            server_seq,
+        )
         info = XtQuantService._xtdata_subscriptions.get(server_seq)
         if info is None:
             raise ValueError(f"未找到订阅: {server_seq}")
@@ -943,6 +1000,12 @@ class XtQuantService(rpyc.Service):
         if callback_id:
             XtQuantService._callback_manager.unregister(callback_id)
         XtQuantService._xtdata_subscriptions.pop(server_seq, None)
+        logger.info(
+            "[行情桥] 退订完成 | client=%s | server_seq=%s | callback_id=%s",
+            self._client_info,
+            server_seq,
+            callback_id,
+        )
         return result
 
     @log_api_call("download_history_data2")

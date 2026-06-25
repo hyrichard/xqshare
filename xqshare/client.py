@@ -775,12 +775,14 @@ class XtQuantRemote:
             name="xqshare-callback-worker",
         )
         self._callback_worker_thread.start()
+        self._logger.info("回调派发 worker 已启动: thread=%s", self._callback_worker_thread.name)
 
     def _callback_worker_loop(self):
         """串行执行回调任务，确保服务器线程能尽快返回。"""
 
         while True:
             if self._stop_callback_worker.is_set() and self._callback_queue.empty():
+                self._logger.info("回调派发 worker 已退出")
                 return
 
             try:
@@ -794,11 +796,36 @@ class XtQuantRemote:
                     continue
 
                 kind, callback_id, event_name, args, kwargs = task
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        self._logger,
+                        "WORKER_BEGIN",
+                        kind=kind,
+                        callback_id=callback_id,
+                        event=event_name,
+                    )
                 if kind == "event":
                     self._callback_registry.invoke_event(callback_id, event_name, *args, **kwargs)
                 else:
                     self._callback_registry.invoke(callback_id, *args, **kwargs)
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        self._logger,
+                        "WORKER_DONE",
+                        kind=kind,
+                        callback_id=callback_id,
+                        event=event_name,
+                    )
             except Exception as exc:
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        self._logger,
+                        "WORKER_ERROR",
+                        kind=kind,
+                        callback_id=callback_id,
+                        event=event_name,
+                        error=type(exc).__name__,
+                    )
                 self._logger.exception(
                     "异步回调执行失败 | kind=%s | callback_id=%s | event=%s | error=%s",
                     kind,
@@ -820,12 +847,20 @@ class XtQuantRemote:
         """将回调转交给后台线程，避免阻塞 RPyC 的服务调用。"""
 
         if self._stop_callback_worker.is_set():
+            if _is_callback_debug_enabled():
+                _log_callback_debug(
+                    self._logger,
+                    "QUEUE_REJECT",
+                    kind=kind,
+                    callback_id=callback_id,
+                    event=event_name,
+                )
             return None
 
         if _is_callback_debug_enabled():
             _log_callback_debug(
                 self._logger,
-                "DISPATCH_QUEUE",
+                "QUEUE_PUT",
                 callback_id=callback_id,
                 event=event_name,
                 payload=_summarize_callback_payload(args, kwargs),
@@ -1188,11 +1223,15 @@ class XtQuantRemote:
         self._reconnect()
 
     def close(self):
+        self._logger.info("开始关闭客户端连接")
         self._stop_heartbeat_thread()
         self._stop_callback_worker.set()
         callback_worker_thread = self._callback_worker_thread
         if callback_worker_thread and threading.current_thread() is not callback_worker_thread:
+            self._logger.info("等待回调派发 worker 退出: thread=%s", callback_worker_thread.name)
             callback_worker_thread.join(timeout=2)
+        elif callback_worker_thread:
+            self._logger.info("当前线程即回调派发 worker，跳过 join: thread=%s", callback_worker_thread.name)
         # 回调线程里触发关闭时，不能让当前线程等待自己退出；这里只负责停止标记和引用清理。
         self._callback_worker_thread = None
         if self._bg_thread:
