@@ -2,7 +2,6 @@
 XtQuant Share (xqshare) Client Tests
 """
 
-import threading
 import pytest
 from unittest.mock import MagicMock, Mock, patch
 
@@ -111,12 +110,7 @@ class TestXtQuantRemote:
         mock_connect.return_value = mock_conn
 
         client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
-        callback_called = threading.Event()
-
-        def callback(payload):
-            callback_called.set()
-
-        callback = Mock(side_effect=callback)
+        callback = Mock()
 
         seq = client.xtdata.subscribe_quote("000001.SZ", period="tick", callback=callback)
         assert seq == 1
@@ -126,8 +120,7 @@ class TestXtQuantRemote:
         callback_id = call_args[3]
         dispatcher = call_args[4]
 
-        assert dispatcher(callback_id, {"000001.SZ": [{"lastPrice": 10.5}]}) is None
-        assert callback_called.wait(1)
+        dispatcher(callback_id, {"000001.SZ": [{"lastPrice": 10.5}]})
         callback.assert_called_once_with({"000001.SZ": [{"lastPrice": 10.5}]})
 
         client.xtdata.unsubscribe_quote(seq)
@@ -198,12 +191,7 @@ class TestXtQuantRemote:
         mock_connect.return_value = mock_conn
 
         client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
-        callback_called = threading.Event()
-
-        def callback(payload):
-            callback_called.set()
-
-        callback = Mock(side_effect=callback)
+        callback = Mock(return_value=None)
 
         seq = client.xtdata.subscribe_l2thousand_queue("000001.SZ", callback, 2, 11.3)
         assert seq == 1
@@ -216,7 +204,6 @@ class TestXtQuantRemote:
         callback_id = call_args[3]
         dispatcher = call_args[4]
         assert dispatcher(callback_id, {"000001.SZ": [{"lastPrice": 9.9}]}) is None
-        assert callback_called.wait(1)
         callback.assert_called_once_with({"000001.SZ": [{"lastPrice": 9.9}]})
 
     @patch('xqshare.client.BgServingThread')
@@ -234,27 +221,16 @@ class TestXtQuantRemote:
         trader = client.create_trader("C:\\QMT\\userdata_mini", 123)
 
         callback_obj = MagicMock()
-        stock_order_called = threading.Event()
-
-        def on_stock_order(payload):
-            stock_order_called.set()
-
-        callback_obj.on_stock_order = Mock(side_effect=on_stock_order)
+        callback_obj.on_stock_order = Mock()
         trader.register_callback(callback_obj)
 
         register_args = trader_remote.register_callback_bridge.call_args[0]
         binding_id = register_args[0]
         event_dispatcher = register_args[1]
-        assert event_dispatcher(binding_id, "on_stock_order", {"order_id": 1}) is None
-        assert stock_order_called.wait(1)
+        event_dispatcher(binding_id, "on_stock_order", {"order_id": 1})
         callback_obj.on_stock_order.assert_called_once_with({"order_id": 1})
 
-        async_callback_called = threading.Event()
-
-        def async_callback(payload):
-            async_callback_called.set()
-
-        async_callback = Mock(side_effect=async_callback)
+        async_callback = Mock(return_value="done")
         result = trader.query_stock_positions_async("account", callback=async_callback)
         assert result == "async-started"
 
@@ -262,8 +238,7 @@ class TestXtQuantRemote:
         assert async_args[0] == "query_stock_positions_async"
         async_callback_id = async_args[3]
         async_dispatcher = async_args[4]
-        assert async_dispatcher(async_callback_id, {"positions": []}) is None
-        assert async_callback_called.wait(1)
+        assert async_dispatcher(async_callback_id, {"positions": []}) == "done"
         async_callback.assert_called_once_with({"positions": []})
 
     @patch('xqshare.client.BgServingThread')
@@ -280,12 +255,7 @@ class TestXtQuantRemote:
         client = XtQuantRemote(host="localhost", port=18812, client_secret="secret", heartbeat_interval=0)
         trader = client.create_trader("C:\\QMT\\userdata_mini", 123)
 
-        async_callback_called = threading.Event()
-
-        def async_callback(payload):
-            async_callback_called.set()
-
-        async_callback = Mock(side_effect=async_callback)
+        async_callback = Mock(return_value="done")
         result = trader.query_stock_orders_async("account", async_callback, False)
         assert result == "async-started"
 
@@ -296,8 +266,7 @@ class TestXtQuantRemote:
 
         async_callback_id = async_args[3]
         async_dispatcher = async_args[4]
-        assert async_dispatcher(async_callback_id, {"orders": []}) is None
-        assert async_callback_called.wait(1)
+        assert async_dispatcher(async_callback_id, {"orders": []}) == "done"
         async_callback.assert_called_once_with({"orders": []})
 
     @patch('xqshare.client.BgServingThread')
@@ -336,23 +305,3 @@ class TestXtQuantRemote:
         trader_remote_2.connect.assert_called_once()
         trader_remote_2.subscribe.assert_called_once_with("account")
         trader_remote_2.register_callback_bridge.assert_called_once()
-
-    def test_close_skips_join_when_called_from_callback_worker_thread(self):
-        client = XtQuantRemote.__new__(XtQuantRemote)
-        client._stop_heartbeat_thread = Mock()
-        client._stop_callback_worker = threading.Event()
-        client._callback_worker_thread = threading.current_thread()
-        bg_thread = Mock()
-        conn = Mock()
-        client._bg_thread = bg_thread
-        client._conn = conn
-        client._connected = True
-        client._logger = Mock()
-
-        client.close()
-
-        client._stop_heartbeat_thread.assert_called_once()
-        bg_thread.stop.assert_called_once()
-        conn.close.assert_called_once()
-        assert client._callback_worker_thread is None
-        assert client._connected is False

@@ -16,7 +16,6 @@ from typing import Any, Dict, Optional
 import rpyc
 from rpyc.utils.server import ThreadedServer
 
-from . import __version__ as XQSHARE_VERSION
 from .auth import (
     AccountLevel,
     PermissionError,
@@ -112,8 +111,14 @@ def _init_logging(log_level="INFO"):
 
 
 def _is_callback_debug_enabled() -> bool:
-    """默认开启 callback 调试日志。"""
-    return True
+    """判断是否开启 callback 调试日志。"""
+    value = os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_callback_debug_value() -> str:
+    """返回 callback 调试环境变量的原始值。"""
+    return os.environ.get("XQSHARE_DEBUG_CALLBACK", "")
 
 
 def _get_logger() -> logging.Logger:
@@ -154,13 +159,15 @@ def _summarize_callback_payload(args: tuple, kwargs: Dict[str, Any]) -> str:
 
 def _log_callback_debug(phase: str, **fields: Any) -> None:
     """输出统一格式的 callback 调试日志。"""
+    if not _is_callback_debug_enabled():
+        return
 
     payload = {
         "thread": threading.current_thread().name,
         **fields,
     }
     message = " ".join(f"{key}={value}" for key, value in payload.items() if value is not None)
-    api_logger.info(f"[CB][SERVER][{phase}] {message}")
+    _get_logger().info(f"[CB][SERVER][{phase}] {message}")
 
 
 # ==================== 日志装饰器 ====================
@@ -357,37 +364,42 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        start_time = time.perf_counter()
-        _log_callback_debug(
-            "FORWARD_START",
-            callback_id=binding_id,
-            kind=info.kind,
-            client=info.client_info,
-            payload=_summarize_callback_payload(args, kwargs),
-        )
+        debug_enabled = _is_callback_debug_enabled()
+        start_time = None
+        if debug_enabled:
+            start_time = time.perf_counter()
+            _log_callback_debug(
+                "FORWARD_START",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
         try:
             result = info.dispatcher(binding_id, *args, **kwargs)
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            _log_callback_debug(
-                "FORWARD_DONE",
-                callback_id=binding_id,
-                kind=info.kind,
-                client=info.client_info,
-                cost_ms=f"{elapsed_ms:.2f}",
-                result=_summarize_callback_value(result),
-            )
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_DONE",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
             return result
         except Exception as exc:
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            _log_callback_debug(
-                "FORWARD_ERROR",
-                callback_id=binding_id,
-                kind=info.kind,
-                client=info.client_info,
-                cost_ms=f"{elapsed_ms:.2f}",
-                error=type(exc).__name__,
-                message=str(exc)[:200],
-            )
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_ERROR",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
             raise
         finally:
             if info.one_shot:
@@ -400,40 +412,45 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        start_time = time.perf_counter()
-        _log_callback_debug(
-            "FORWARD_START",
-            callback_id=binding_id,
-            kind=info.kind,
-            client=info.client_info,
-            event=event_name,
-            payload=_summarize_callback_payload(args, kwargs),
-        )
+        debug_enabled = _is_callback_debug_enabled()
+        start_time = None
+        if debug_enabled:
+            start_time = time.perf_counter()
+            _log_callback_debug(
+                "FORWARD_START",
+                callback_id=binding_id,
+                kind=info.kind,
+                client=info.client_info,
+                event=event_name,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
         try:
             result = info.dispatcher(binding_id, event_name, *args, **kwargs)
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            _log_callback_debug(
-                "FORWARD_DONE",
-                callback_id=binding_id,
-                kind=info.kind,
-                client=info.client_info,
-                event=event_name,
-                cost_ms=f"{elapsed_ms:.2f}",
-                result=_summarize_callback_value(result),
-            )
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_DONE",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
             return result
         except Exception as exc:
-            elapsed_ms = (time.perf_counter() - start_time) * 1000
-            _log_callback_debug(
-                "FORWARD_ERROR",
-                callback_id=binding_id,
-                kind=info.kind,
-                client=info.client_info,
-                event=event_name,
-                cost_ms=f"{elapsed_ms:.2f}",
-                error=type(exc).__name__,
-                message=str(exc)[:200],
-            )
+            if debug_enabled:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_ERROR",
+                    callback_id=binding_id,
+                    kind=info.kind,
+                    client=info.client_info,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
             raise
 
     def list_callbacks(self):
@@ -470,12 +487,13 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
 
     def _forward_event(self, event_name: str, *args, **kwargs):
         """统一记录并转发交易事件。"""
-        _log_callback_debug(
-            "EVENT_RECV",
-            callback_id=self._binding_id,
-            event=event_name,
-            payload=_summarize_callback_payload(args, kwargs),
-        )
+        if _is_callback_debug_enabled():
+            _log_callback_debug(
+                "EVENT_RECV",
+                callback_id=self._binding_id,
+                event=event_name,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
         return self._callback_manager.invoke_event(self._binding_id, event_name, *args, **kwargs)
 
     def on_disconnected(self):
@@ -521,12 +539,13 @@ class TraderCallbackAdapter(XtQuantTraderCallbackBase):
         """兜底转发未显式声明的 `on_*` 交易回调。"""
         if name.startswith("on_"):
             def handler(*args, **kwargs):
-                _log_callback_debug(
-                    "EVENT_FALLBACK",
-                    callback_id=self._binding_id,
-                    event=name,
-                    payload=_summarize_callback_payload(args, kwargs),
-                )
+                if _is_callback_debug_enabled():
+                    _log_callback_debug(
+                        "EVENT_FALLBACK",
+                        callback_id=self._binding_id,
+                        event=name,
+                        payload=_summarize_callback_payload(args, kwargs),
+                    )
                 return self._forward_event(name, *args, **kwargs)
             return handler
         raise AttributeError(name)
@@ -719,12 +738,6 @@ class TraderBridge:
 
     def register_callback_bridge(self, binding_id: str, dispatcher):
         self._check("xttrader.register_callback")
-        logger.info(
-            "[回调桥] 开始注册交易回调 | client=%s | session_id=%s | binding_id=%s",
-            self._client_info_getter(),
-            self.session_id,
-            binding_id,
-        )
         self._callback_manager.register(
             binding_id,
             dispatcher,
@@ -743,40 +756,13 @@ class TraderBridge:
         )
         # 纸面交易模式不需要向真实 trader 注册回调
         if self.is_paper_mode:
-            logger.info(
-                "[回调桥] 交易回调注册完成(paper) | client=%s | session_id=%s | binding_id=%s",
-                self._client_info_getter(),
-                self.session_id,
-                binding_id,
-            )
             return 0
         if hasattr(self._trader, "register_callback"):
-            result = self._trader.register_callback(self._callback_adapter)
-            logger.info(
-                "[回调桥] 交易回调注册完成 | client=%s | session_id=%s | binding_id=%s | result=%s",
-                self._client_info_getter(),
-                self.session_id,
-                binding_id,
-                _summarize_result(result),
-            )
-            return result
-        logger.info(
-            "[回调桥] 交易回调注册完成 | client=%s | session_id=%s | binding_id=%s | result=None",
-            self._client_info_getter(),
-            self.session_id,
-            binding_id,
-        )
+            return self._trader.register_callback(self._callback_adapter)
         return None
 
     def invoke_async_bridge(self, method_name: str, args, kwargs, callback_id: str, dispatcher):
         self._check(f"xttrader.{method_name}", tuple(args), dict(kwargs))
-        logger.info(
-            "[异步桥] 开始发起交易异步调用 | client=%s | session_id=%s | method=%s | callback_id=%s",
-            self._client_info_getter(),
-            self.session_id,
-            method_name,
-            callback_id,
-        )
         self._callback_manager.register(
             callback_id,
             dispatcher,
@@ -792,33 +778,25 @@ class TraderBridge:
             client=self._client_info_getter(),
             method=method_name,
             session_id=self.session_id,
-            payload=_summarize_callback_payload(tuple(args), dict(kwargs)) if True else None,
+            payload=_summarize_callback_payload(tuple(args), dict(kwargs)) if _is_callback_debug_enabled() else None,
         )
 
         def on_result(*cb_args, **cb_kwargs):
-            _log_callback_debug(
-                "ASYNC_RESULT_RECV",
-                callback_id=callback_id,
-                kind="xttrader_async",
-                client=self._client_info_getter(),
-                method=method_name,
-                payload=_summarize_callback_payload(cb_args, cb_kwargs),
-            )
+            if _is_callback_debug_enabled():
+                _log_callback_debug(
+                    "ASYNC_RESULT_RECV",
+                    callback_id=callback_id,
+                    kind="xttrader_async",
+                    client=self._client_info_getter(),
+                    method=method_name,
+                    payload=_summarize_callback_payload(cb_args, cb_kwargs),
+                )
             return self._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
 
         method = getattr(self._trader, method_name)
         call_kwargs = dict(kwargs)
         call_kwargs["callback"] = on_result
-        result = _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
-        logger.info(
-            "[异步桥] 交易异步调用已提交 | client=%s | session_id=%s | method=%s | callback_id=%s | result=%s",
-            self._client_info_getter(),
-            self.session_id,
-            method_name,
-            callback_id,
-            _summarize_result(result),
-        )
-        return result
+        return _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
 
     def __getattr__(self, name):
         # 纸面交易模式下拦截交易操作
@@ -1091,11 +1069,9 @@ class XtQuantService(rpyc.Service):
         except Exception:
             self._client_info = "unknown"
         logger.info(f"[连接] 客户端接入: {self._client_info}")
-        logger.info(f"[连接] 会话初始化完成: client={self._client_info}")
 
     def on_disconnect(self, conn):
         client_info = getattr(self, '_client_info', 'unknown')
-        logger.info(f"[断开] 开始清理客户端会话: {client_info}")
         to_remove = [
             server_seq for server_seq, info in list(XtQuantService._xtdata_subscriptions.items())
             if info.get("client_info") == client_info
@@ -1217,11 +1193,7 @@ class XtQuantService(rpyc.Service):
                 "userdata_path": userdata_path,
                 "session_id": session_id,
             })()
-            logger.info(
-                "[创建Trader] mode=paper | userdata_path=%s | session_id=%s",
-                userdata_path,
-                session_id,
-            )
+            logger.info(f"[创建Trader] mode=paper | userdata_path={userdata_path} | session_id={session_id}")
         else:
             if not XTQUANT_AVAILABLE:
                 raise RuntimeError("xtquant 库未安装")
@@ -1233,7 +1205,6 @@ class XtQuantService(rpyc.Service):
 
             trader = XtQuantTrader(userdata_path, session_id)
             logger.info(f"[创建Trader] mode=real | userdata_path={userdata_path} | session_id={session_id}")
-        logger.info(f"[创建Trader] 交易对象就绪 | client={self._client_info} | session_id={session_id}")
         return TraderBridge(
             trader,
             userdata_path,
@@ -1249,12 +1220,6 @@ class XtQuantService(rpyc.Service):
     def exposed_subscribe_xtdata_bridge(self, method_name: str, args: tuple, kwargs: dict,
                                         callback_id: str, dispatcher):
         self._require_auth()
-        logger.info(
-            "[行情桥] 开始订阅 | client=%s | method=%s | callback_id=%s",
-            self._client_info,
-            method_name,
-            callback_id,
-        )
 
         full_name = f"xtdata.{method_name}"
         permission_kwargs = dict(kwargs)
@@ -1287,13 +1252,6 @@ class XtQuantService(rpyc.Service):
                 "method_name": method_name,
                 "unsubscribe_method": _get_xtdata_unsubscribe_method(method_name),
             }
-            logger.info(
-                "[行情桥] 订阅完成 | client=%s | method=%s | callback_id=%s | server_seq=%s",
-                self._client_info,
-                method_name,
-                callback_id,
-                server_seq,
-            )
             return server_seq
         except Exception:
             XtQuantService._callback_manager.unregister(callback_id)
@@ -1302,11 +1260,6 @@ class XtQuantService(rpyc.Service):
     @log_api_call("unsubscribe_xtdata_bridge")
     def exposed_unsubscribe_xtdata_bridge(self, server_seq):
         self._require_auth()
-        logger.info(
-            "[行情桥] 开始退订 | client=%s | server_seq=%s",
-            self._client_info,
-            server_seq,
-        )
         info = XtQuantService._xtdata_subscriptions.get(server_seq)
         if info is None:
             raise ValueError(f"未找到订阅: {server_seq}")
@@ -1320,12 +1273,6 @@ class XtQuantService(rpyc.Service):
         if callback_id:
             XtQuantService._callback_manager.unregister(callback_id)
         XtQuantService._xtdata_subscriptions.pop(server_seq, None)
-        logger.info(
-            "[行情桥] 退订完成 | client=%s | server_seq=%s | callback_id=%s",
-            self._client_info,
-            server_seq,
-            callback_id,
-        )
         return result
 
     @log_api_call("download_history_data2")
@@ -1426,24 +1373,28 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
 
     _init_logging(log_level)
     XtQuantService._start_time = time.time()
+    callback_debug_value = _get_callback_debug_value()
+    callback_debug_enabled = _is_callback_debug_enabled()
 
     print("=" * 70)
     print("  XtQuant Share (xqshare) 服务")
-    print(f"  版本号: {XQSHARE_VERSION}")
     print("=" * 70)
     print(f"  监听地址: {host}:{port}")
     print(f"  SSL 加密: {'启用' if use_ssl else '禁用'}")
     print(f"  日志级别: {log_level}")
     print(f"  交易后端: {'纸面交易' if is_paper_trader_mode() else '真实柜台'}")
-    print("  Callback调试: 启用")
+    print(f"  Callback调试: {'启用' if callback_debug_enabled else '关闭'} "
+          f"(XQSHARE_DEBUG_CALLBACK={callback_debug_value!r})")
     print("=" * 70)
 
     if XtQuantService._permission_checker is None:
         XtQuantService._permission_checker = get_permission_checker()
 
     logger.info(
-        f"服务启动 | version={XQSHARE_VERSION} | host={host} | port={port} | ssl={use_ssl} | "
-        f"env_file={env_file!r}"
+        f"服务启动 | host={host} | port={port} | ssl={use_ssl} | "
+        f"callback_debug={callback_debug_enabled} | "
+        f"XQSHARE_DEBUG_CALLBACK={callback_debug_value!r} | "
+        f"trader_mode={'paper' if is_paper_trader_mode() else 'real'} | env_file={env_file!r}"
     )
 
     config = {

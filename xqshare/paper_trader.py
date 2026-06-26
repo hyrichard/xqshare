@@ -1275,7 +1275,6 @@ class PaperSimulator:
             secu_account=trade_state.secu_account,
             instrument_name=trade_state.instrument_name,
         )
-
     def _resolve_instrument_name(self, stock_code: str) -> str:
         """尽量从 xtdata 中解析证券名称。"""
         normalized_stock_code = _normalize_stock_code(stock_code)
@@ -1710,4 +1709,3 @@ class PaperSimulator:
             secu_account=order_state.secu_account,
             instrument_name=order_state.instrument_name,
         )
-
