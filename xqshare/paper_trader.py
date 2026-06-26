@@ -1548,26 +1548,21 @@ class PaperSimulator:
         ]
 
     # 单笔订单最多撮合次数，超过后剩余数量一次性成交。
-    _MAX_FILL_ROUNDS = 12
+    _MAX_FILL_ROUNDS = 4
 
     def _last_fill_round(self, round_index: int) -> bool:
         """判断当前是否为最后一轮撮合。"""
         return round_index >= self._MAX_FILL_ROUNDS
 
     def _build_next_fill_volume(self, remaining_volume: int) -> int:
-        """把剩余数量拆成一个可观测的部分成交切片。
-
-        切得更细以产生更多轮撮合，使回调事件量足以在 callback worker 队列积压，
-        从而在撤单时更易复现真实柜台常见的回调阻塞卡单现象。
-        """
+        """把剩余数量拆成一个可观测的部分成交切片。"""
         if remaining_volume <= 1:
             return remaining_volume
         if remaining_volume == 2:
             return 1
-        # 每次成交约 1/6 的剩余量，让大批量订单产生更多轮撮合
-        first_cut = max(1, remaining_volume // 6)
+        first_cut = max(1, remaining_volume // 3)
         if first_cut >= remaining_volume:
-            first_cut = max(1, remaining_volume - 1)
+            first_cut = remaining_volume - 1
         return max(first_cut, 1)
 
     def _apply_fill_locked(
