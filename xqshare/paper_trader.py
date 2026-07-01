@@ -1767,7 +1767,7 @@ class PaperTraderRuntime:
         """纸面交易 disconnect：推送 on_disconnected 并停止 ticker。"""
         if self._callback_adapter is not None:
             self._callback_adapter.on_disconnected()
-        self._stop_paper_ticker()
+        self.stop()
         LOGGER.info("[纸面交易] disconnect | session_id=%s", self._session_id)
 
     def subscribe(self, account: Any, *args: Any, **kwargs: Any) -> int:
