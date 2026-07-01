@@ -136,6 +136,8 @@ def _create_paper_bridge(xtdata, seed, fill_interval=0.1, session_id=1):
     adapter = TraderCallbackAdapter(binding_id, callback_manager)
     bridge._callback_binding_id = binding_id
     bridge._callback_adapter = adapter
+    if bridge._paper_runtime is not None:
+        bridge._paper_runtime.set_callback_adapter(adapter)
 
     return bridge, recorder, sim
 

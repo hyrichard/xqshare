@@ -1,8 +1,8 @@
 """纸面交易模拟核心。
 
-本模块只负责模拟交易的状态管理和撮合逻辑，不处理回调派发、
-线程调度或网络桥接。这些职责由 server.py 的 TraderBridge 承担，
-确保模拟路径与真实柜台路径走同一套回调链路。
+本模块负责纸面交易的状态管理、撮合逻辑与运行时编排。
+其中 PaperSimulator 只维护委托、成交、资金和持仓等纯状态，
+PaperTraderRuntime 负责把模拟器接到与真实柜台相近的调用路径上。
 
 主要职责：
 1. 管理账户资金、持仓、委托和成交的内部状态。
@@ -530,8 +530,8 @@ class PaperSimulator:
     """纸面交易模拟器。
 
     只负责账户状态管理和撮合逻辑，不处理回调派发和线程调度。
-    所有模拟操作的结果通过返回值交给调用方（server.py 的 TraderBridge），
-    由 TraderBridge 决定如何派发回调和推送事件。
+    所有模拟操作的结果通过返回值交给调用方（PaperTraderRuntime 或外层桥接层），
+    由运行时决定如何派发回调和推送事件。
 
     外部通过调用 tick() 推进活跃订单的生命周期，
     tick() 返回待推送的事件列表，由调用方负责派发。
@@ -1709,3 +1709,370 @@ class PaperSimulator:
             secu_account=order_state.secu_account,
             instrument_name=order_state.instrument_name,
         )
+
+
+class PaperTraderRuntime:
+    """纸面交易运行时。
+
+    该层负责把 PaperSimulator 接到与真实柜台相似的执行路径上，
+    包括 callback 派发、撮合 ticker、下单与撤单的外部入口。
+    纯状态和撮合细节仍然留在 PaperSimulator 中。
+    """
+
+    def __init__(self, simulator: PaperSimulator, session_id: int | None = None) -> None:
+        """初始化纸面交易运行时。"""
+        self._simulator = simulator
+        self._session_id = session_id
+        self._callback_adapter: Any = None
+        self._paper_ticker_thread: threading.Thread | None = None
+        self._paper_stop_event = threading.Event()
+        self._paper_active_orders: dict[int, tuple[str, str]] = {}
+        self._paper_lock = threading.Lock()
+
+    def set_callback_adapter(self, callback_adapter: Any) -> None:
+        """设置交易回调适配器，由 server.py 的桥接层传入。"""
+        self._callback_adapter = callback_adapter
+
+    def stop(self) -> None:
+        """停止纸面交易运行时。"""
+        self._paper_stop_event.set()
+        self._simulator.stop()
+        if self._paper_ticker_thread is not None:
+            self._paper_ticker_thread.join(timeout=2)
+            self._paper_ticker_thread = None
+        LOGGER.info("[纸面交易] stop | session_id=%s", self._session_id)
+
+    def register_callback(self, callback: Any = None) -> int:
+        """兼容纸面交易模式下直接调用 register_callback 的场景。"""
+        LOGGER.info("[纸面交易] register_callback | session_id=%s", self._session_id)
+        return 0
+
+    def set_callback(self, callback: Any = None) -> int:
+        """兼容 set_callback 的别名入口。"""
+        return self.register_callback(callback)
+
+    def start(self, *args: Any, **kwargs: Any) -> int:
+        """纸面交易 start：只记录会话已启动。"""
+        LOGGER.info("[纸面交易] start | session_id=%s", self._session_id)
+        return 0
+
+    def connect(self) -> int:
+        """纸面交易 connect：模拟连接成功并推送 on_connected。"""
+        if self._callback_adapter is not None:
+            self._callback_adapter.on_connected()
+        LOGGER.info("[纸面交易] connect | session_id=%s", self._session_id)
+        return 0
+
+    def disconnect(self) -> None:
+        """纸面交易 disconnect：推送 on_disconnected 并停止 ticker。"""
+        if self._callback_adapter is not None:
+            self._callback_adapter.on_disconnected()
+        self._stop_paper_ticker()
+        LOGGER.info("[纸面交易] disconnect | session_id=%s", self._session_id)
+
+    def subscribe(self, account: Any, *args: Any, **kwargs: Any) -> int:
+        """纸面交易 subscribe：初始化账户状态并推送账户状态事件。"""
+        events = self._simulator.subscribe_account(account)
+        self._emit_paper_events(events)
+        LOGGER.info("[纸面交易] subscribe | session_id=%s", self._session_id)
+        return 0
+
+    def subscribe_account(self, account: Any, *args: Any, **kwargs: Any) -> int:
+        """subscribe_account 与 subscribe 走同一条纸面交易路径。"""
+        return self.subscribe(account, *args, **kwargs)
+
+    def unsubscribe(self, account: Any, *args: Any, **kwargs: Any) -> int:
+        """纸面交易 unsubscribe：只取消内部订阅标记。"""
+        self._simulator.unsubscribe_account(account)
+        return 0
+
+    def unsubscribe_account(self, account: Any, *args: Any, **kwargs: Any) -> int:
+        """unsubscribe_account 与 unsubscribe 走同一条纸面交易路径。"""
+        return self.unsubscribe(account, *args, **kwargs)
+
+    def order_stock(
+        self,
+        account: Any,
+        stock_code: str,
+        order_type: int,
+        order_volume: int,
+        price_type: int,
+        price: float,
+        strategy_name: str = "",
+        order_remark: str = "",
+    ) -> int:
+        """纸面交易下单：委托给模拟器并启动撮合 ticker。"""
+        order_id, events = self._simulator.order_stock(
+            account,
+            stock_code,
+            order_type,
+            order_volume,
+            price_type,
+            price,
+            strategy_name,
+            order_remark,
+        )
+        self._emit_paper_events(events)
+
+        account_key = self._simulator._get_account_key(account)
+        if self._simulator.is_order_active(account_key, order_id):
+            with self._paper_lock:
+                self._paper_active_orders[order_id] = account_key
+            self._start_paper_ticker()
+        return order_id
+
+    def order_stock_async(
+        self,
+        account: Any,
+        stock_code: str,
+        order_type: int,
+        order_volume: int,
+        price_type: int,
+        price: float,
+        strategy_name: str = "",
+        order_remark: str = "",
+        callback: Any = None,
+    ) -> int:
+        """纸面交易异步下单：复用同步下单结果并回调响应对象。"""
+        order_id = self.order_stock(
+            account,
+            stock_code,
+            order_type,
+            order_volume,
+            price_type,
+            price,
+            strategy_name,
+            order_remark,
+        )
+        if callable(callback):
+            order = self._simulator.query_stock_order(account, order_id)
+            asset = self._simulator.query_stock_asset(account)
+            callback(PaperOrderResponse(
+                account_type=asset.account_type,
+                account_id=asset.account_id,
+                order_id=order_id,
+                strategy_name=strategy_name,
+                order_remark=order_remark,
+                error_msg="" if (order and order.order_status != self._simulator.constants.order_junk) else (
+                    "废单" if order else "未知错误"
+                ),
+                seq=order_id,
+                order_sysid=order.order_sysid if order else "",
+            ))
+        return order_id
+
+    def cancel_order_stock(self, account: Any, order_id: int) -> int:
+        """纸面交易撤单：保持与真实柜台相近的同步返回语义。"""
+        return self._simulator.cancel_order_stock_with_sync(account, order_id, self._emit_paper_events)
+
+    def cancel_order_stock_async(self, account: Any, order_id: int, callback: Any = None) -> int:
+        """纸面交易异步撤单：复用模拟器的异步撤单处理。"""
+        return self._simulator.cancel_order_stock_async_with_sync(
+            account,
+            order_id,
+            self._emit_paper_events,
+            callback,
+        )
+
+    def cancel_order_stock_sysid(self, account: Any, market: Any, sysid: str) -> int:
+        """按系统委托编号撤单。"""
+        return self._simulator.cancel_order_stock_sysid_with_sync(
+            account,
+            market,
+            sysid,
+            self._emit_paper_events,
+        )
+
+    def cancel_order_stock_sysid_async(self, account: Any, market: Any, sysid: str, callback: Any = None) -> int:
+        """按系统委托编号异步撤单。"""
+        return self._simulator.cancel_order_stock_sysid_async_with_sync(
+            account,
+            market,
+            sysid,
+            self._emit_paper_events,
+            callback,
+        )
+
+    def query_stock_asset(self, account: Any) -> PaperAsset:
+        """查询账户资金。"""
+        return self._simulator.query_stock_asset(account)
+
+    def query_stock_position(self, account: Any, stock_code: str) -> PaperPosition | None:
+        """查询单只持仓。"""
+        return self._simulator.query_stock_position(account, stock_code)
+
+    def query_stock_positions(self, account: Any) -> list[PaperPosition]:
+        """查询全部持仓。"""
+        return self._simulator.query_stock_positions(account)
+
+    def query_stock_order(self, account: Any, order_id: int) -> PaperOrder | None:
+        """查询单笔委托。"""
+        return self._simulator.query_stock_order(account, order_id)
+
+    def query_stock_orders(self, account: Any, cancelable_only: bool = False) -> list[PaperOrder]:
+        """查询委托列表。"""
+        return self._simulator.query_stock_orders(account, cancelable_only)
+
+    def query_stock_trades(self, account: Any) -> list[PaperTrade]:
+        """查询成交列表。"""
+        return self._simulator.query_stock_trades(account)
+
+    def query_account_status(self) -> list[PaperAccountStatus]:
+        """查询账户状态。"""
+        return self._simulator.query_account_status()
+
+    def query_account_infos(self) -> list[PaperAccountInfo]:
+        """查询账户信息。"""
+        return self._simulator.query_account_infos()
+
+    def query_stock_asset_async(self, account: Any, callback: Any = None) -> int:
+        """异步查询账户资金。"""
+        if callable(callback):
+            callback(self._simulator.query_stock_asset(account))
+        return 0
+
+    def query_stock_positions_async(self, account: Any, callback: Any = None) -> int:
+        """异步查询账户持仓。"""
+        if callable(callback):
+            callback(self._simulator.query_stock_positions(account))
+        return 0
+
+    def query_stock_orders_async(
+        self,
+        account: Any,
+        cancelable_only: bool = False,
+        callback: Any = None,
+    ) -> int:
+        """异步查询委托列表。"""
+        if callable(callback):
+            callback(self._simulator.query_stock_orders(account, cancelable_only))
+        return 0
+
+    def query_stock_trades_async(self, account: Any, callback: Any = None) -> int:
+        """异步查询成交列表。"""
+        if callable(callback):
+            callback(self._simulator.query_stock_trades(account))
+        return 0
+
+    def query_account_status_async(self, callback: Any = None) -> int:
+        """异步查询账户状态。"""
+        if callable(callback):
+            callback(self._simulator.query_account_status())
+        return 0
+
+    def query_account_infos_async(self, callback: Any = None) -> int:
+        """异步查询账户信息。"""
+        if callable(callback):
+            callback(self._simulator.query_account_infos())
+        return 0
+
+    def query_credit_detail(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纸面交易暂不支持信用查询，返回空字典。"""
+        return {}
+
+    def query_credit_detail_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纸面交易暂不支持信用查询，异步同样返回空字典。"""
+        callback = kwargs.get("callback")
+        if callable(callback):
+            callback({})
+        return {}
+
+    def query_stk_compacts(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """纸面交易暂不支持该接口。"""
+        return []
+
+    def query_credit_subjects(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """纸面交易暂不支持该接口。"""
+        return []
+
+    def query_credit_slo_code(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """纸面交易暂不支持该接口。"""
+        return []
+
+    def query_credit_assure(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """纸面交易暂不支持该接口。"""
+        return []
+
+    def query_new_purchase_limit(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纸面交易暂不支持新股申购额度查询，返回空字典。"""
+        return {}
+
+    def query_new_purchase_limit_async(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纸面交易暂不支持新股申购额度查询，异步返回空字典。"""
+        callback = kwargs.get("callback")
+        if callable(callback):
+            callback({})
+        return {}
+
+    def unsupported(self, *args: Any, **kwargs: Any) -> list[Any]:
+        """纸面交易不支持且返回类型应为列表的接口。"""
+        return []
+
+    def unsupported_dict(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """纸面交易不支持且返回类型应为字典的接口。"""
+        return {}
+
+    def _emit_paper_events(self, events: list[PaperEvent]) -> None:
+        """通过 callback 适配器派发纸面交易事件。"""
+        if not events or self._callback_adapter is None:
+            return
+        executor = self._simulator._ensure_executor()
+        for event in events:
+            handler = getattr(self._callback_adapter, event.event_name, None)
+            if callable(handler):
+                executor.submit(self._do_emit_paper_event, handler, event)
+
+    @staticmethod
+    def _do_emit_paper_event(handler, event) -> None:
+        """在模拟器的单线程执行器中派发单个事件。"""
+        try:
+            handler(event.data)
+        except Exception:
+            LOGGER.exception("[纸面交易] 回调派发异常 | event=%s", event.event_name)
+
+    def _start_paper_ticker(self) -> None:
+        """启动纸面交易撮合线程。"""
+        if self._paper_ticker_thread is not None and self._paper_ticker_thread.is_alive():
+            return
+        self._paper_stop_event.clear()
+        self._paper_ticker_thread = threading.Thread(
+            target=self._paper_ticker_loop,
+            daemon=True,
+            name=f"paper-ticker-{self._session_id}",
+        )
+        self._paper_ticker_thread.start()
+        LOGGER.info("[纸面交易] 撮合线程已启动 | session_id=%s", self._session_id)
+
+    def _stop_paper_ticker(self) -> None:
+        """停止纸面交易撮合线程。"""
+        self._paper_stop_event.set()
+        if self._paper_ticker_thread is not None:
+            self._paper_ticker_thread.join(timeout=2)
+            self._paper_ticker_thread = None
+
+    def _paper_ticker_loop(self) -> None:
+        """后台循环推进活跃订单的撮合。"""
+        while not self._paper_stop_event.is_set():
+            try:
+                self._paper_ticker_tick()
+            except Exception:
+                LOGGER.exception("[纸面交易] 撮合循环异常 | session_id=%s", self._session_id)
+            self._paper_stop_event.wait(self._simulator.fill_interval_seconds)
+
+    def _paper_ticker_tick(self) -> None:
+        """推进所有活跃订单的一次 tick。"""
+        with self._paper_lock:
+            order_tasks = list(self._paper_active_orders.items())
+
+        finished: list[int] = []
+        for order_id, account_key in order_tasks:
+            events = self._simulator.tick(account_key, order_id)
+            if events is not None:
+                self._emit_paper_events(events)
+            if not self._simulator.is_order_active(account_key, order_id):
+                finished.append(order_id)
+
+        if finished:
+            with self._paper_lock:
+                for order_id in finished:
+                    self._paper_active_orders.pop(order_id, None)

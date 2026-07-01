@@ -21,7 +21,7 @@ from .auth import (
     PermissionError,
     get_permission_checker,
 )
-from .paper_trader import PAPER_TRADER_MODE_ENV, PaperSimulator, PaperEvent, is_paper_trader_mode
+from .paper_trader import PAPER_TRADER_MODE_ENV, PaperSimulator, PaperTraderRuntime, is_paper_trader_mode
 
 # Import xtquant (only available on Windows)
 try:
@@ -644,12 +644,8 @@ class TraderBridge:
         self.userdata_path = userdata_path
         self.session_id = session_id
 
-        # 纸面交易相关状态
         self._paper = paper_simulator
-        self._paper_ticker_thread: Optional[threading.Thread] = None
-        self._paper_stop_event = threading.Event()
-        self._paper_active_orders: dict[int, tuple[str, str]] = {}  # order_id -> account_key
-        self._paper_lock = threading.Lock()
+        self._paper_runtime = PaperTraderRuntime(paper_simulator, session_id=session_id) if paper_simulator else None
 
     def _check(self, method_name: str, args=(), kwargs=None):
         error = _check_permission(self._permission_checker, self._account_level, method_name, args, kwargs)
@@ -660,81 +656,7 @@ class TraderBridge:
     @property
     def is_paper_mode(self) -> bool:
         """是否为纸面交易模式。"""
-        return self._paper is not None
-
-    def _emit_paper_events(self, events: list) -> None:
-        """通过 CallbackManager 派发纸面交易事件。
-
-        对齐 xtquant 的 executor.submit(callback, data) 机制：
-        提交到 PaperSimulator 的单线程池执行，不等待返回。
-        当线程池被之前的推送占住时，后续推送和 cancel 响应排队。
-        """
-        if not events or self._callback_adapter is None:
-            return
-        executor = self._paper._ensure_executor()
-        for event in events:
-            handler = getattr(self._callback_adapter, event.event_name, None)
-            if callable(handler):
-                executor.submit(self._do_emit_paper_event, handler, event)
-
-    @staticmethod
-    def _do_emit_paper_event(handler, event) -> None:
-        """在 executor 线程中执行单个纸面交易事件推送。"""
-        try:
-            handler(event.data)
-        except Exception:
-            logger.exception("[纸面交易] 回调派发异常 | event=%s", event.event_name)
-
-    def _start_paper_ticker(self) -> None:
-        """启动纸面交易撮合推进线程。"""
-        if self._paper_ticker_thread is not None and self._paper_ticker_thread.is_alive():
-            return
-        self._paper_stop_event.clear()
-        self._paper_ticker_thread = threading.Thread(
-            target=self._paper_ticker_loop,
-            daemon=True,
-            name=f"paper-ticker-{self.session_id}",
-        )
-        self._paper_ticker_thread.start()
-        logger.info("[纸面交易] 撮合线程已启动 | session_id=%s", self.session_id)
-
-    def _stop_paper_ticker(self) -> None:
-        """停止纸面交易撮合推进线程。"""
-        self._paper_stop_event.set()
-        if self._paper is not None:
-            self._paper.stop()
-        if self._paper_ticker_thread is not None:
-            self._paper_ticker_thread.join(timeout=2)
-            self._paper_ticker_thread = None
-
-    def _paper_ticker_loop(self) -> None:
-        """后台循环：推进所有活跃订单的撮合。"""
-        while not self._paper_stop_event.is_set():
-            try:
-                self._paper_ticker_tick()
-            except Exception:
-                logger.exception("[纸面交易] 撮合循环异常 | session_id=%s", self.session_id)
-            self._paper_stop_event.wait(self._paper.fill_interval_seconds if self._paper else 0.05)
-
-    def _paper_ticker_tick(self) -> None:
-        """扫描所有活跃账户的活跃订单并推进一次 tick。"""
-        if self._paper is None:
-            return
-        # 收集所有活跃订单
-        with self._paper_lock:
-            order_tasks = list(self._paper_active_orders.items())
-        finished = []
-        for order_id, account_key in order_tasks:
-            events = self._paper.tick(account_key, order_id)
-            if events is not None:
-                self._emit_paper_events(events)
-            # 检查是否仍在活跃
-            if not self._paper.is_order_active(account_key, order_id):
-                finished.append(order_id)
-        if finished:
-            with self._paper_lock:
-                for order_id in finished:
-                    self._paper_active_orders.pop(order_id, None)
+        return self._paper_runtime is not None
 
     def register_callback_bridge(self, binding_id: str, dispatcher):
         self._check("xttrader.register_callback")
@@ -747,6 +669,8 @@ class TraderBridge:
         )
         self._callback_binding_id = binding_id
         self._callback_adapter = TraderCallbackAdapter(binding_id, self._callback_manager)
+        if self._paper_runtime is not None:
+            self._paper_runtime.set_callback_adapter(self._callback_adapter)
         _log_callback_debug(
             "REGISTER",
             callback_id=binding_id,
@@ -793,246 +717,22 @@ class TraderBridge:
                 )
             return self._callback_manager.invoke(callback_id, *cb_args, **cb_kwargs)
 
-        method = getattr(self._trader, method_name)
         call_kwargs = dict(kwargs)
         call_kwargs["callback"] = on_result
+        if self.is_paper_mode and self._paper_runtime is not None:
+            method = getattr(self._paper_runtime, method_name)
+            return _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
+        method = getattr(self._trader, method_name)
         return _log_call(f"xttrader.{method_name}", self._client_info_getter(), method, *args, **call_kwargs)
 
     def __getattr__(self, name):
-        # 纸面交易模式下拦截交易操作
-        if self.is_paper_mode:
-            handler = self._get_paper_method(name)
+        # 纸面交易模式下把交易方法转发到 runtime。
+        if self.is_paper_mode and self._paper_runtime is not None:
+            runtime_name = name[7:] if name.startswith("_paper_") else name
+            handler = getattr(self._paper_runtime, runtime_name, None)
             if handler is not None:
                 return handler
         return getattr(self._proxy, name)
-
-    def _get_paper_method(self, name: str):
-        """返回纸面交易模式下对应方法的处理器，无匹配则返回 None。"""
-        paper_methods = {
-            "start": self._paper_start,
-            "stop": self._paper_stop,
-            "connect": self._paper_connect,
-            "disconnect": self._paper_disconnect,
-            "subscribe": self._paper_subscribe,
-            "unsubscribe": self._paper_unsubscribe,
-            "subscribe_account": self._paper_subscribe,
-            "unsubscribe_account": self._paper_unsubscribe,
-            "register_callback": self._paper_register_callback,
-            "set_callback": self._paper_register_callback,
-            "order_stock": self._paper_order_stock,
-            "order_stock_async": self._paper_order_stock_async,
-            "cancel_order_stock": self._paper_cancel_order_stock,
-            "cancel_order_stock_async": self._paper_cancel_order_stock_async,
-            "cancel_order_stock_sysid": self._paper_cancel_order_stock_sysid,
-            "cancel_order_stock_sysid_async": self._paper_cancel_order_stock_sysid_async,
-            "query_stock_asset": self._paper_query_stock_asset,
-            "query_stock_position": self._paper_query_stock_position,
-            "query_stock_positions": self._paper_query_stock_positions,
-            "query_stock_order": self._paper_query_stock_order,
-            "query_stock_orders": self._paper_query_stock_orders,
-            "query_stock_trades": self._paper_query_stock_trades,
-            "query_account_status": self._paper_query_account_status,
-            "query_account_infos": self._paper_query_account_infos,
-            "query_account_status_async": self._paper_query_account_status_async,
-            "query_account_infos_async": self._paper_query_account_infos_async,
-            "query_stock_asset_async": self._paper_query_stock_asset_async,
-            "query_stock_positions_async": self._paper_query_stock_positions_async,
-            "query_stock_orders_async": self._paper_query_stock_orders_async,
-            "query_stock_trades_async": self._paper_query_stock_trades_async,
-            "query_credit_detail": self._paper_unsupported_dict,
-            "query_credit_detail_async": self._paper_unsupported_dict,
-            "query_stk_compacts": self._paper_unsupported,
-            "query_credit_subjects": self._paper_unsupported,
-            "query_credit_slo_code": self._paper_unsupported,
-            "query_credit_assure": self._paper_unsupported,
-            "query_new_purchase_limit": self._paper_unsupported_dict,
-        }
-        return paper_methods.get(name)
-
-    def _paper_register_callback(self, callback=None) -> int:
-        """纸面交易 register_callback：空操作。
-
-        回调已在 register_callback_bridge 阶段通过 CallbackManager 桥接完成，
-        这里只兼容本地模式直接调用 register_callback 的场景。
-        """
-        logger.info("[纸面交易] register_callback | session_id=%s", self.session_id)
-        return 0
-
-    def _paper_start(self, *args, **kwargs) -> int:
-        """纸面交易 start：标记会话启动。"""
-        logger.info("[纸面交易] start | session_id=%s", self.session_id)
-        return 0
-
-    def _paper_stop(self) -> None:
-        """纸面交易 stop：停止撮合线程。"""
-        self._stop_paper_ticker()
-        logger.info("[纸面交易] stop | session_id=%s", self.session_id)
-
-    def _paper_connect(self) -> int:
-        """纸面交易 connect：模拟连接成功，推送 on_connected。"""
-        if self._callback_adapter is not None:
-            self._callback_adapter.on_connected()
-        logger.info("[纸面交易] connect | session_id=%s", self.session_id)
-        return 0
-
-    def _paper_disconnect(self) -> None:
-        """纸面交易 disconnect：推送 on_disconnected。"""
-        if self._callback_adapter is not None:
-            self._callback_adapter.on_disconnected()
-        self._stop_paper_ticker()
-        logger.info("[纸面交易] disconnect | session_id=%s", self.session_id)
-
-    def _paper_subscribe(self, account, *args, **kwargs) -> int:
-        """纸面交易 subscribe：初始化账户状态并推送事件。"""
-        events = self._paper.subscribe_account(account)
-        self._emit_paper_events(events)
-        logger.info("[纸面交易] subscribe | session_id=%s", self.session_id)
-        return 0
-
-    def _paper_unsubscribe(self, account, *args, **kwargs) -> int:
-        """纸面交易 unsubscribe。"""
-        self._paper.unsubscribe_account(account)
-        return 0
-
-    def _paper_order_stock(self, account, stock_code, order_type, order_volume,
-                           price_type, price, strategy_name="", order_remark="") -> int:
-        """纸面交易下单：委托给 PaperSimulator，派发回调，启动撮合。"""
-        order_id, events = self._paper.order_stock(
-            account, stock_code, order_type, order_volume,
-            price_type, price, strategy_name, order_remark,
-        )
-        self._emit_paper_events(events)
-        # 如果订单被接受（非废单），注册到活跃订单并启动撮合
-        if self._paper.is_order_active(self._paper._get_account_key(account), order_id):
-            with self._paper_lock:
-                self._paper_active_orders[order_id] = self._paper._get_account_key(account)
-            self._start_paper_ticker()
-        return order_id
-
-    def _paper_order_stock_async(self, account, stock_code, order_type, order_volume,
-                                  price_type, price, strategy_name="", order_remark="",
-                                  callback=None) -> int:
-        """纸面交易异步下单。"""
-        from .paper_trader import PaperOrderResponse
-        order_id = self._paper_order_stock(
-            account, stock_code, order_type, order_volume,
-            price_type, price, strategy_name, order_remark,
-        )
-        if callable(callback):
-            order = self._paper.query_stock_order(account, order_id)
-            asset = self._paper.query_stock_asset(account)
-            response = PaperOrderResponse(
-                account_type=asset.account_type,
-                account_id=asset.account_id,
-                order_id=order_id,
-                strategy_name=strategy_name,
-                order_remark=order_remark,
-                error_msg="" if (order and order.order_status != 57) else ("废单" if order else "未知错误"),
-                seq=order_id,
-                order_sysid=order.order_sysid if order else "",
-            )
-            callback(response)
-        return order_id
-
-    def _paper_cancel_order_stock(self, account, order_id) -> int:
-        """纸面交易撤单，委托给 PaperSimulator 处理。"""
-        return self._paper.cancel_order_stock_with_sync(account, order_id, self._emit_paper_events)
-
-
-    def _paper_cancel_order_stock_async(self, account, order_id, callback=None) -> int:
-        """纸面交易异步撤单，委托给 PaperSimulator 处理。"""
-        return self._paper.cancel_order_stock_async_with_sync(account, order_id, self._emit_paper_events, callback)
-
-
-    def _paper_cancel_order_stock_sysid(self, account, market, sysid) -> int:
-        """纸面交易按系统编号撤单，委托给 PaperSimulator 处理。"""
-        return self._paper.cancel_order_stock_sysid_with_sync(account, market, sysid, self._emit_paper_events)
-
-
-    def _paper_cancel_order_stock_sysid_async(self, account, market, sysid, callback=None) -> int:
-        """纸面交易按系统编号异步撤单，委托给 PaperSimulator 处理。"""
-        return self._paper.cancel_order_stock_sysid_async_with_sync(account, market, sysid, self._emit_paper_events, callback)
-
-
-    def _paper_query_stock_asset(self, account):
-        """纸面交易查询资金。"""
-        return self._paper.query_stock_asset(account)
-
-    def _paper_query_stock_position(self, account, stock_code):
-        """纸面交易查询单只持仓。"""
-        return self._paper.query_stock_position(account, stock_code)
-
-    def _paper_query_stock_positions(self, account):
-        """纸面交易查询所有持仓。"""
-        return self._paper.query_stock_positions(account)
-
-    def _paper_query_stock_order(self, account, order_id):
-        """纸面交易查询单笔委托。"""
-        return self._paper.query_stock_order(account, order_id)
-
-    def _paper_query_stock_orders(self, account, cancelable_only=False):
-        """纸面交易查询委托列表。"""
-        return self._paper.query_stock_orders(account, cancelable_only)
-
-    def _paper_query_stock_trades(self, account):
-        """纸面交易查询成交列表。"""
-        return self._paper.query_stock_trades(account)
-
-    def _paper_query_account_status(self):
-        """纸面交易查询账户状态。"""
-        return self._paper.query_account_status()
-
-    def _paper_query_account_infos(self):
-        """纸面交易查询账户信息。"""
-        return self._paper.query_account_infos()
-
-    def _paper_query_account_status_async(self, callback=None) -> int:
-        """纸面交易异步查询账户状态。"""
-        if callable(callback):
-            callback(self._paper.query_account_status())
-        return 0
-
-    def _paper_query_account_infos_async(self, callback=None) -> int:
-        """纸面交易异步查询账户信息。"""
-        if callable(callback):
-            callback(self._paper.query_account_infos())
-        return 0
-
-    def _paper_query_stock_asset_async(self, account, callback=None) -> int:
-        """纸面交易异步查询资金。"""
-        if callable(callback):
-            callback(self._paper.query_stock_asset(account))
-        return 0
-
-    def _paper_query_stock_positions_async(self, account, callback=None) -> int:
-        """纸面交易异步查询持仓。"""
-        if callable(callback):
-            callback(self._paper.query_stock_positions(account))
-        return 0
-
-    def _paper_query_stock_orders_async(self, account, cancelable_only=False, callback=None) -> int:
-        """纸面交易异步查询委托。"""
-        if callable(callback):
-            callback(self._paper.query_stock_orders(account, cancelable_only))
-        return 0
-
-    def _paper_query_stock_trades_async(self, account, callback=None) -> int:
-        """纸面交易异步查询成交。"""
-        if callable(callback):
-            callback(self._paper.query_stock_trades(account))
-        return 0
-
-    def _paper_unsupported(self, *args, **kwargs):
-        """纸面交易不支持的接口，默认返回空列表。
-
-        query_credit_detail 和 query_new_purchase_limit 返回空字典，
-        因为真实柜台返回 dict 结构，空列表会破坏调用方的索引访问。
-        """
-        return []
-
-    def _paper_unsupported_dict(self, *args, **kwargs):
-        """纸面交易不支持且返回类型应为 dict 的接口。"""
-        return {}
 
 
 # ==================== 服务类 ====================
