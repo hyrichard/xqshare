@@ -8,6 +8,7 @@ import os
 import ssl
 import threading
 import time
+from queue import Empty, Queue
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
@@ -616,6 +617,9 @@ class XtQuantRemote:
         self._trader_states: List[TraderModuleState] = []
         self._callback_debug_enabled = _is_callback_debug_enabled()
         self._callback_debug_value = _get_callback_debug_value()
+        self._callback_queue: Queue = Queue()
+        self._callback_worker_thread: threading.Thread | None = None
+        self._callback_worker_stop = threading.Event()
 
         self._xtdata = RemoteModule(self, 'xtdata')
         self._xttrader = RemoteModule(self, 'xttrader')
@@ -753,6 +757,112 @@ class XtQuantRemote:
         self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self._heartbeat_thread.start()
 
+    def _ensure_callback_worker(self) -> None:
+        """延迟启动回调消费线程。"""
+        if self._callback_worker_thread is not None and self._callback_worker_thread.is_alive():
+            return
+        self._callback_worker_stop.clear()
+        self._callback_worker_thread = threading.Thread(
+            target=self._callback_worker_loop,
+            name="xqshare-callback-worker",
+            daemon=True,
+        )
+        self._callback_worker_thread.start()
+
+    def _callback_worker_loop(self) -> None:
+        """串行消费本地回调队列，避免阻塞 RPyC 线程。"""
+        while True:
+            if self._callback_worker_stop.is_set():
+                try:
+                    item = self._callback_queue.get_nowait()
+                except Empty:
+                    break
+            else:
+                try:
+                    item = self._callback_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+
+            if item is None:
+                self._callback_queue.task_done()
+                break
+
+            kind = item["kind"]
+            callback_id = item["callback_id"]
+            event_name = item.get("event_name")
+            args = item.get("args", ())
+            kwargs = item.get("kwargs", {})
+            start_time = time.perf_counter()
+
+            _log_callback_debug(
+                self._logger,
+                "DISPATCH_RECV",
+                callback_id=callback_id,
+                kind=kind,
+                event=event_name,
+                payload=_summarize_callback_payload(args, kwargs),
+            )
+
+            try:
+                if kind == "trader":
+                    result = self._callback_registry.invoke_event(callback_id, event_name, *args, **kwargs)
+                else:
+                    result = self._callback_registry.invoke(callback_id, *args, **kwargs)
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    self._logger,
+                    "DISPATCH_DONE",
+                    callback_id=callback_id,
+                    kind=kind,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    self._logger,
+                    "DISPATCH_ERROR",
+                    callback_id=callback_id,
+                    kind=kind,
+                    event=event_name,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
+            finally:
+                self._callback_queue.task_done()
+
+    def _enqueue_callback(
+        self,
+        *,
+        callback_id: str,
+        kind: str,
+        event_name: str | None = None,
+        args: Tuple[Any, ...] = (),
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """把回调任务放入本地队列，立刻返回给 RPyC 线程。"""
+        self._ensure_callback_worker()
+        payload_kwargs = dict(kwargs or {})
+        _log_callback_debug(
+            self._logger,
+            "QUEUE_PUT",
+            callback_id=callback_id,
+            kind=kind,
+            event=event_name,
+            payload=_summarize_callback_payload(args, payload_kwargs),
+        )
+        self._callback_queue.put(
+            {
+                "callback_id": callback_id,
+                "kind": kind,
+                "event_name": event_name,
+                "args": tuple(args),
+                "kwargs": payload_kwargs,
+            }
+        )
+
     def _heartbeat_loop(self):
         while not self._stop_heartbeat.is_set():
             try:
@@ -829,79 +939,18 @@ class XtQuantRemote:
         return None, args, kwargs
 
     def _dispatch_callback(self, callback_id: str, *args, **kwargs):
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
-            _log_callback_debug(
-                self._logger,
-                "DISPATCH_RECV",
-                callback_id=callback_id,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
-        try:
-            result = self._callback_registry.invoke(callback_id, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "DISPATCH_DONE",
-                    callback_id=callback_id,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
-            return result
-        except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "DISPATCH_ERROR",
-                    callback_id=callback_id,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
-            raise
+        self._enqueue_callback(callback_id=callback_id, kind="xtdata", args=tuple(args), kwargs=dict(kwargs))
+        return None
 
     def _dispatch_trader_event(self, binding_id: str, event_name: str, *args, **kwargs):
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
-            _log_callback_debug(
-                self._logger,
-                "DISPATCH_RECV",
-                callback_id=binding_id,
-                event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
-        try:
-            result = self._callback_registry.invoke_event(binding_id, event_name, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "DISPATCH_DONE",
-                    callback_id=binding_id,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
-            return result
-        except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    self._logger,
-                    "DISPATCH_ERROR",
-                    callback_id=binding_id,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
-            raise
+        self._enqueue_callback(
+            callback_id=binding_id,
+            kind="trader",
+            event_name=event_name,
+            args=tuple(args),
+            kwargs=dict(kwargs),
+        )
+        return None
 
     def _call_xtdata_subscribe(self, method_name: str, args, kwargs):
         callback, args_wo_cb, kwargs_wo_cb = self._extract_callback(
@@ -1161,6 +1210,11 @@ class XtQuantRemote:
 
     def close(self):
         self._stop_heartbeat_thread()
+        self._callback_worker_stop.set()
+        self._callback_queue.put(None)
+        if self._callback_worker_thread:
+            self._callback_worker_thread.join(timeout=2)
+            self._callback_worker_thread = None
         if self._bg_thread:
             self._bg_thread.stop()
             self._bg_thread = None

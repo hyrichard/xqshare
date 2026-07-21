@@ -851,10 +851,46 @@ class PaperSimulator:
         seq = random.randint(100000, 999999)
         future: Future = Future()
         self._cancel_cbs[seq] = lambda cancel_result: future.set_result(cancel_result)
-        self._ensure_executor().submit(
+        executor = self._ensure_executor()
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_SUBMIT_PRE] thread=%s order_id=%s seq=%s "
+            "executor_id=%s queue_size=%s worker_count=%s alive_workers=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            id(executor),
+            getattr(executor, "_work_queue", None).qsize(),
+            len(getattr(executor, "_threads", ())),
+            sum(1 for worker in getattr(executor, "_threads", ()) if worker.is_alive()),
+        )
+        submitted_future = executor.submit(
             self._do_cancel_order_stock_sync, account, order_id, emit_events, seq,
         )
-        return future.result()
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_SUBMIT_DONE] thread=%s order_id=%s seq=%s "
+            "executor_id=%s queue_size=%s future_done=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            id(executor),
+            getattr(executor, "_work_queue", None).qsize(),
+            submitted_future.done(),
+        )
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_WAIT] thread=%s order_id=%s seq=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+        )
+        cancel_result = future.result()
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_RETURN] thread=%s order_id=%s seq=%s cancel_result=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            cancel_result,
+        )
+        return cancel_result
 
     def cancel_order_stock_sysid_with_sync(
         self, account: Any, market: Any, sysid: str, emit_events: Any,
@@ -895,36 +931,90 @@ class PaperSimulator:
         self, account: Any, order_id: int, emit_events: Any, seq: int,
     ) -> None:
         """在 executor 线程中执行撤单，对齐 xtquant 的 on_common_resp_callback。"""
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_ENTER] thread=%s order_id=%s seq=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+        )
         cancel_result, _events = self.cancel_order_stock(account, order_id)
         sync_reject_events = self.cancel_order_stock_sync_check(account, order_id)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_EMIT] thread=%s order_id=%s seq=%s events=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            [event.event_name for event in sync_reject_events],
+        )
         emit_events(sync_reject_events)
         callback = self._cancel_cbs.pop(seq, None)
         if callback:
             callback(cancel_result)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_EXIT] thread=%s order_id=%s seq=%s cancel_result=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            cancel_result,
+        )
 
     def _do_cancel_order_stock_sysid_sync(
         self, account: Any, market: Any, sysid: str, emit_events: Any, seq: int,
     ) -> None:
         """在 executor 线程中执行按系统编号撤单。"""
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_SYNC_ENTER] thread=%s sysid=%s seq=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+        )
         cancel_result, _events = self.cancel_order_stock_sysid(account, market, sysid)
         sync_reject_events = self.cancel_order_stock_sysid_sync_check(account, market, sysid)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_SYNC_EMIT] thread=%s sysid=%s seq=%s events=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+            [event.event_name for event in sync_reject_events],
+        )
         emit_events(sync_reject_events)
         callback = self._cancel_cbs.pop(seq, None)
         if callback:
             callback(cancel_result)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_SYNC_EXIT] thread=%s sysid=%s seq=%s cancel_result=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+            cancel_result,
+        )
 
     def _do_cancel_order_stock_async_sync(
         self, account: Any, order_id: int, emit_events: Any, callback: Any, seq: int,
     ) -> None:
         """在 executor 线程中执行异步撤单。"""
         from .paper_trader import PaperCancelOrderResponse
+        LOGGER.info(
+            "[纸面交易][CANCEL_ASYNC_ENTER] thread=%s order_id=%s seq=%s has_callback=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            callable(callback),
+        )
         cancel_result, _events = self.cancel_order_stock(account, order_id)
         sync_reject_events = self.cancel_order_stock_sync_check(account, order_id)
+        LOGGER.info(
+            "[纸面交易][CANCEL_ASYNC_EMIT] thread=%s order_id=%s seq=%s events=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            [event.event_name for event in sync_reject_events],
+        )
         emit_events(sync_reject_events)
         if callable(callback):
             account_state = self._get_or_create_account_state(account)[0]
             order = self.query_stock_order(account, order_id)
-            callback(PaperCancelOrderResponse(
+            response = PaperCancelOrderResponse(
                 account_type=account_state.account_type,
                 account_id=account_state.account_id,
                 cancel_result=cancel_result,
@@ -932,19 +1022,50 @@ class PaperSimulator:
                 order_sysid=order.order_sysid if order else "",
                 seq=seq,
                 error_msg="" if cancel_result == 0 else "撤单失败",
-            ))
+            )
+            LOGGER.info(
+                "[纸面交易][CANCEL_ASYNC_RESP] thread=%s order_id=%s seq=%s "
+                "cancel_result=%s sysid=%s",
+                threading.current_thread().name,
+                order_id,
+                seq,
+                response.cancel_result,
+                response.order_sysid,
+            )
+            callback(response)
+        LOGGER.info(
+            "[纸面交易][CANCEL_ASYNC_EXIT] thread=%s order_id=%s seq=%s cancel_result=%s",
+            threading.current_thread().name,
+            order_id,
+            seq,
+            cancel_result,
+        )
 
     def _do_cancel_order_stock_sysid_async_sync(
         self, account: Any, market: Any, sysid: str, emit_events: Any, callback: Any, seq: int,
     ) -> None:
         """在 executor 线程中执行按系统编号异步撤单。"""
         from .paper_trader import PaperCancelOrderResponse
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_ASYNC_ENTER] thread=%s sysid=%s seq=%s has_callback=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+            callable(callback),
+        )
         cancel_result, _events = self.cancel_order_stock_sysid(account, market, sysid)
         sync_reject_events = self.cancel_order_stock_sysid_sync_check(account, market, sysid)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_ASYNC_EMIT] thread=%s sysid=%s seq=%s events=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+            [event.event_name for event in sync_reject_events],
+        )
         emit_events(sync_reject_events)
         if callable(callback):
             account_state = self._get_or_create_account_state(account)[0]
-            callback(PaperCancelOrderResponse(
+            response = PaperCancelOrderResponse(
                 account_type=account_state.account_type,
                 account_id=account_state.account_id,
                 cancel_result=cancel_result,
@@ -952,7 +1073,23 @@ class PaperSimulator:
                 order_sysid=str(sysid),
                 seq=seq,
                 error_msg="" if cancel_result == 0 else "撤单失败",
-            ))
+            )
+            LOGGER.info(
+                "[纸面交易][CANCEL_SYSID_ASYNC_RESP] thread=%s sysid=%s seq=%s "
+                "cancel_result=%s",
+                threading.current_thread().name,
+                sysid,
+                seq,
+                response.cancel_result,
+            )
+            callback(response)
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYSID_ASYNC_EXIT] thread=%s sysid=%s seq=%s cancel_result=%s",
+            threading.current_thread().name,
+            sysid,
+            seq,
+            cancel_result,
+        )
 
     # ==================== 订单生命周期推进 ====================
 
@@ -974,10 +1111,25 @@ class PaperSimulator:
             if order_state.order_status in self._constants.terminal_order_statuses:
                 return None
             if order_state.cancel_requested:
+                LOGGER.info(
+                    "[纸面交易][SIM_TICK_CANCEL] account_key=%s order_id=%s traded=%s/%s status=%s",
+                    account_key,
+                    order_id,
+                    order_state.traded_volume,
+                    order_state.order_volume,
+                    order_state.order_status,
+                )
                 return self._apply_cancel_locked(account_state, order_state)
 
             remaining_volume = max(order_state.order_volume - order_state.traded_volume, 0)
             if remaining_volume <= 0:
+                LOGGER.info(
+                    "[纸面交易][SIM_TICK_DONE] account_key=%s order_id=%s traded=%s/%s",
+                    account_key,
+                    order_id,
+                    order_state.traded_volume,
+                    order_state.order_volume,
+                )
                 order_state.order_status = self._constants.order_succeeded
                 order_state.status_msg = "已成"
                 order_snapshot = self._build_order_snapshot_locked(order_state)
@@ -989,12 +1141,28 @@ class PaperSimulator:
             else:
                 fill_volume = self._build_next_fill_volume(remaining_volume)
             if fill_volume <= 0:
+                LOGGER.info(
+                    "[纸面交易][SIM_TICK_JUNK] account_key=%s order_id=%s remaining=%s",
+                    account_key,
+                    order_id,
+                    remaining_volume,
+                )
                 order_state.order_status = self._constants.order_junk
                 order_state.status_msg = "废单"
                 order_snapshot = self._build_order_snapshot_locked(order_state)
                 return [PaperEvent("on_stock_order", order_snapshot)]
 
             trade_state = self._apply_fill_locked(account_state, order_state, fill_volume)
+            LOGGER.info(
+                "[纸面交易][SIM_TICK_FILL] account_key=%s order_id=%s fill_volume=%s traded=%s/%s "
+                "status=%s",
+                account_key,
+                order_id,
+                fill_volume,
+                order_state.traded_volume,
+                order_state.order_volume,
+                order_state.order_status,
+            )
             trade_snapshot = self._build_trade_snapshot_locked(trade_state)
             order_snapshot = self._build_order_snapshot_locked(order_state)
 
@@ -1573,6 +1741,17 @@ class PaperSimulator:
         """在持锁状态下应用一次成交，并更新资金与持仓。"""
         fill_price = order_state.price
         fill_amount = round(fill_volume * fill_price, 2)
+        LOGGER.info(
+            "[纸面交易][SIM_FILL_APPLY] order_id=%s stock=%s fill_volume=%s fill_price=%s fill_amount=%s "
+            "prev_traded=%s prev_amount=%s",
+            order_state.order_id,
+            order_state.stock_code,
+            fill_volume,
+            fill_price,
+            fill_amount,
+            order_state.traded_volume,
+            order_state.traded_amount,
+        )
         order_state.traded_volume += fill_volume
         order_state.traded_amount = round(order_state.traded_amount + fill_amount, 2)
         order_state.trade_count += 1
@@ -1637,6 +1816,17 @@ class PaperSimulator:
         """
         events: list[PaperEvent] = []
         remaining_volume = max(order_state.order_volume - order_state.traded_volume, 0)
+        LOGGER.info(
+            "[纸面交易][SIM_CANCEL_APPLY] order_id=%s stock=%s traded=%s/%s remaining=%s status=%s "
+            "cancel_requested=%s",
+            order_state.order_id,
+            order_state.stock_code,
+            order_state.traded_volume,
+            order_state.order_volume,
+            remaining_volume,
+            order_state.order_status,
+            order_state.cancel_requested,
+        )
 
         # 如果已经全部成交，撤单被柜台拒绝，与真实 on_cancel_error 一致
         if remaining_volume <= 0:
@@ -1716,6 +1906,8 @@ class PaperTraderRuntime:
 
     该层负责把 PaperSimulator 接到与真实柜台相似的执行路径上，
     包括 callback 派发、撮合 ticker、下单与撤单的外部入口。
+    push 事件始终走共享单线程派发器；响应类回调在关闭宽松顺序时
+    也走同一条队列，打开后则切换到独立的响应派发器。
     纯状态和撮合细节仍然留在 PaperSimulator 中。
     """
 
@@ -1724,14 +1916,32 @@ class PaperTraderRuntime:
         self._simulator = simulator
         self._session_id = session_id
         self._callback_adapter: Any = None
+        self._relaxed_response_order_enabled = False
         self._paper_ticker_thread: threading.Thread | None = None
         self._paper_stop_event = threading.Event()
         self._paper_active_orders: dict[int, tuple[str, str]] = {}
         self._paper_lock = threading.Lock()
+        self._relaxed_response_executor: ThreadPoolExecutor | None = None
 
     def set_callback_adapter(self, callback_adapter: Any) -> None:
         """设置交易回调适配器，由 server.py 的桥接层传入。"""
         self._callback_adapter = callback_adapter
+
+    def set_relaxed_response_order_enabled(self, enabled: bool) -> int:
+        """设置响应顺序是否与 push 事件解耦。
+
+        关闭时，响应类回调和 push 事件共享同一条单线程派发队列；
+        打开后，响应类回调改走独立队列，避免被 push 回调占住。
+        这与 xtquant 原始实现中的 relaxed response order 语义一致。
+        """
+
+        self._relaxed_response_order_enabled = bool(enabled)
+        LOGGER.info(
+            "[纸面交易] set_relaxed_response_order_enabled | session_id=%s enabled=%s",
+            self._session_id,
+            self._relaxed_response_order_enabled,
+        )
+        return 0
 
     def stop(self) -> None:
         """停止纸面交易运行时。"""
@@ -1740,6 +1950,9 @@ class PaperTraderRuntime:
         if self._paper_ticker_thread is not None:
             self._paper_ticker_thread.join(timeout=2)
             self._paper_ticker_thread = None
+        if self._relaxed_response_executor is not None:
+            self._relaxed_response_executor.shutdown(wait=True)
+            self._relaxed_response_executor = None
         LOGGER.info("[纸面交易] stop | session_id=%s", self._session_id)
 
     def register_callback(self, callback: Any = None) -> int:
@@ -1758,15 +1971,13 @@ class PaperTraderRuntime:
 
     def connect(self) -> int:
         """纸面交易 connect：模拟连接成功并推送 on_connected。"""
-        if self._callback_adapter is not None:
-            self._callback_adapter.on_connected()
+        self._emit_named_callback("on_connected")
         LOGGER.info("[纸面交易] connect | session_id=%s", self._session_id)
         return 0
 
     def disconnect(self) -> None:
         """纸面交易 disconnect：推送 on_disconnected 并停止 ticker。"""
-        if self._callback_adapter is not None:
-            self._callback_adapter.on_disconnected()
+        self._emit_named_callback("on_disconnected")
         self.stop()
         LOGGER.info("[纸面交易] disconnect | session_id=%s", self._session_id)
 
@@ -1812,6 +2023,19 @@ class PaperTraderRuntime:
             strategy_name,
             order_remark,
         )
+        LOGGER.info(
+            "[纸面交易][ORDER] session_id=%s thread=%s order_id=%s stock=%s type=%s volume=%s "
+            "price_type=%s price=%s events=%s",
+            self._session_id,
+            threading.current_thread().name,
+            order_id,
+            _normalize_stock_code(stock_code),
+            order_type,
+            order_volume,
+            price_type,
+            price,
+            [event.event_name for event in events],
+        )
         self._emit_paper_events(events)
 
         account_key = self._simulator._get_account_key(account)
@@ -1847,7 +2071,7 @@ class PaperTraderRuntime:
         if callable(callback):
             order = self._simulator.query_stock_order(account, order_id)
             asset = self._simulator.query_stock_asset(account)
-            callback(PaperOrderResponse(
+            response = PaperOrderResponse(
                 account_type=asset.account_type,
                 account_id=asset.account_id,
                 order_id=order_id,
@@ -1858,15 +2082,39 @@ class PaperTraderRuntime:
                 ),
                 seq=order_id,
                 order_sysid=order.order_sysid if order else "",
-            ))
+            )
+            LOGGER.info(
+                "[纸面交易][ORDER_ASYNC_RESP] session_id=%s thread=%s order_id=%s sysid=%s "
+                "order_status=%s relaxed=%s",
+                self._session_id,
+                threading.current_thread().name,
+                order_id,
+                order.order_sysid if order else "",
+                order.order_status if order else None,
+                self._relaxed_response_order_enabled,
+            )
+            self._submit_push_callback(callback, response)
         return order_id
 
     def cancel_order_stock(self, account: Any, order_id: int) -> int:
         """纸面交易撤单：保持与真实柜台相近的同步返回语义。"""
+        LOGGER.info(
+            "[纸面交易][CANCEL_SYNC_CALL] session_id=%s thread=%s order_id=%s",
+            self._session_id,
+            threading.current_thread().name,
+            order_id,
+        )
         return self._simulator.cancel_order_stock_with_sync(account, order_id, self._emit_paper_events)
 
     def cancel_order_stock_async(self, account: Any, order_id: int, callback: Any = None) -> int:
         """纸面交易异步撤单：复用模拟器的异步撤单处理。"""
+        LOGGER.info(
+            "[纸面交易][CANCEL_ASYNC_CALL] session_id=%s thread=%s order_id=%s has_callback=%s",
+            self._session_id,
+            threading.current_thread().name,
+            order_id,
+            callable(callback),
+        )
         return self._simulator.cancel_order_stock_async_with_sync(
             account,
             order_id,
@@ -1928,13 +2176,13 @@ class PaperTraderRuntime:
     def query_stock_asset_async(self, account: Any, callback: Any = None) -> int:
         """异步查询账户资金。"""
         if callable(callback):
-            callback(self._simulator.query_stock_asset(account))
+            self._submit_response_callback(callback, self._simulator.query_stock_asset(account))
         return 0
 
     def query_stock_positions_async(self, account: Any, callback: Any = None) -> int:
         """异步查询账户持仓。"""
         if callable(callback):
-            callback(self._simulator.query_stock_positions(account))
+            self._submit_response_callback(callback, self._simulator.query_stock_positions(account))
         return 0
 
     def query_stock_orders_async(
@@ -1945,25 +2193,28 @@ class PaperTraderRuntime:
     ) -> int:
         """异步查询委托列表。"""
         if callable(callback):
-            callback(self._simulator.query_stock_orders(account, cancelable_only))
+            self._submit_response_callback(
+                callback,
+                self._simulator.query_stock_orders(account, cancelable_only),
+            )
         return 0
 
     def query_stock_trades_async(self, account: Any, callback: Any = None) -> int:
         """异步查询成交列表。"""
         if callable(callback):
-            callback(self._simulator.query_stock_trades(account))
+            self._submit_response_callback(callback, self._simulator.query_stock_trades(account))
         return 0
 
     def query_account_status_async(self, callback: Any = None) -> int:
         """异步查询账户状态。"""
         if callable(callback):
-            callback(self._simulator.query_account_status())
+            self._submit_response_callback(callback, self._simulator.query_account_status())
         return 0
 
     def query_account_infos_async(self, callback: Any = None) -> int:
         """异步查询账户信息。"""
         if callable(callback):
-            callback(self._simulator.query_account_infos())
+            self._submit_response_callback(callback, self._simulator.query_account_infos())
         return 0
 
     def query_credit_detail(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1974,7 +2225,7 @@ class PaperTraderRuntime:
         """纸面交易暂不支持信用查询，异步同样返回空字典。"""
         callback = kwargs.get("callback")
         if callable(callback):
-            callback({})
+            self._submit_response_callback(callback, {})
         return {}
 
     def query_stk_compacts(self, *args: Any, **kwargs: Any) -> list[Any]:
@@ -2001,7 +2252,7 @@ class PaperTraderRuntime:
         """纸面交易暂不支持新股申购额度查询，异步返回空字典。"""
         callback = kwargs.get("callback")
         if callable(callback):
-            callback({})
+            self._submit_response_callback(callback, {})
         return {}
 
     def unsupported(self, *args: Any, **kwargs: Any) -> list[Any]:
@@ -2016,19 +2267,157 @@ class PaperTraderRuntime:
         """通过 callback 适配器派发纸面交易事件。"""
         if not events or self._callback_adapter is None:
             return
-        executor = self._simulator._ensure_executor()
+        executor = self._get_push_executor()
+        LOGGER.info(
+            "[纸面交易][PUSH_DISPATCH] session_id=%s thread=%s executor_id=%s event_count=%s events=%s",
+            self._session_id,
+            threading.current_thread().name,
+            id(executor),
+            len(events),
+            [event.event_name for event in events],
+        )
         for event in events:
             handler = getattr(self._callback_adapter, event.event_name, None)
             if callable(handler):
                 executor.submit(self._do_emit_paper_event, handler, event)
 
+    def _emit_named_callback(self, event_name: str) -> None:
+        """派发无参数的连接类回调。"""
+        if self._callback_adapter is None:
+            return
+        handler = getattr(self._callback_adapter, event_name, None)
+        if callable(handler):
+            executor = self._get_push_executor()
+            LOGGER.info(
+                "[纸面交易][PUSH_DISPATCH] session_id=%s thread=%s executor_id=%s event=%s",
+                self._session_id,
+                threading.current_thread().name,
+                id(executor),
+                event_name,
+            )
+            executor.submit(self._do_emit_named_callback, handler, event_name)
+
     @staticmethod
     def _do_emit_paper_event(handler, event) -> None:
         """在模拟器的单线程执行器中派发单个事件。"""
+        LOGGER.info(
+            "[纸面交易][PUSH_ENTER] thread=%s event=%s",
+            threading.current_thread().name,
+            event.event_name,
+        )
         try:
             handler(event.data)
         except Exception:
             LOGGER.exception("[纸面交易] 回调派发异常 | event=%s", event.event_name)
+        finally:
+            LOGGER.info(
+                "[纸面交易][PUSH_EXIT] thread=%s event=%s",
+                threading.current_thread().name,
+                event.event_name,
+            )
+
+    @staticmethod
+    def _do_emit_named_callback(handler, event_name: str) -> None:
+        """在单线程执行器中派发无参数回调。"""
+        LOGGER.info(
+            "[纸面交易][PUSH_ENTER] thread=%s event=%s",
+            threading.current_thread().name,
+            event_name,
+        )
+        try:
+            handler()
+        except Exception:
+            LOGGER.exception("[纸面交易] 回调派发异常 | event=%s", event_name)
+        finally:
+            LOGGER.info(
+                "[纸面交易][PUSH_EXIT] thread=%s event=%s",
+                threading.current_thread().name,
+                event_name,
+            )
+
+    def _ensure_relaxed_response_executor(self) -> ThreadPoolExecutor:
+        """延迟创建宽松响应顺序专用派发器。"""
+        if self._relaxed_response_executor is None:
+            self._relaxed_response_executor = ThreadPoolExecutor(max_workers=1)
+        return self._relaxed_response_executor
+
+    def _get_push_executor(self) -> ThreadPoolExecutor:
+        """获取 push 事件和同步响应共用的派发器。"""
+        executor = self._simulator._ensure_executor()
+        LOGGER.info(
+            "[纸面交易][EXECUTOR_SELECT] session_id=%s thread=%s kind=push executor_id=%s relaxed=%s",
+            self._session_id,
+            threading.current_thread().name,
+            id(executor),
+            self._relaxed_response_order_enabled,
+        )
+        return executor
+
+    def _get_response_executor(self) -> ThreadPoolExecutor:
+        """获取当前应使用的响应类回调派发器。"""
+        if self._relaxed_response_order_enabled:
+            executor = self._ensure_relaxed_response_executor()
+            LOGGER.info(
+                "[纸面交易][EXECUTOR_SELECT] session_id=%s thread=%s kind=response executor_id=%s relaxed=%s",
+                self._session_id,
+                threading.current_thread().name,
+                id(executor),
+                True,
+            )
+            return executor
+        executor = self._simulator._ensure_executor()
+        LOGGER.info(
+            "[纸面交易][EXECUTOR_SELECT] session_id=%s thread=%s kind=response executor_id=%s relaxed=%s",
+            self._session_id,
+            threading.current_thread().name,
+            id(executor),
+            False,
+        )
+        return executor
+
+    def _submit_push_callback(self, callback: Any, response: Any) -> None:
+        """把 push 类异步回调放入共享派发器。"""
+        if not callable(callback):
+            return
+        LOGGER.info(
+            "[纸面交易][RESP_SUBMIT] session_id=%s thread=%s kind=push response_type=%s",
+            self._session_id,
+            threading.current_thread().name,
+            type(response).__name__,
+        )
+        self._get_push_executor().submit(self._do_submit_response_callback, callback, response)
+
+    def _submit_response_callback(self, callback: Any, response: Any) -> None:
+        """把异步响应放入 response 派发器。"""
+        if not callable(callback):
+            return
+        LOGGER.info(
+            "[纸面交易][RESP_SUBMIT] session_id=%s thread=%s kind=response response_type=%s relaxed=%s",
+            self._session_id,
+            threading.current_thread().name,
+            type(response).__name__,
+            self._relaxed_response_order_enabled,
+        )
+        self._get_response_executor().submit(self._do_submit_response_callback, callback, response)
+
+    @staticmethod
+    def _do_submit_response_callback(callback: Any, response: Any) -> None:
+        """在 response 派发器线程中执行异步响应回调。"""
+        LOGGER.info(
+            "[纸面交易][RESP_ENTER] thread=%s response_type=%s",
+            threading.current_thread().name,
+            type(response).__name__,
+        )
+        try:
+            callback(response)
+        except Exception:
+            LOGGER.exception("[纸面交易] 响应回调派发异常")
+        finally:
+            LOGGER.info(
+                "[纸面交易][RESP_EXIT] thread=%s response_type=%s",
+                threading.current_thread().name,
+                type(response).__name__,
+            )
 
     def _start_paper_ticker(self) -> None:
         """启动纸面交易撮合线程。"""
@@ -2063,11 +2452,25 @@ class PaperTraderRuntime:
         """推进所有活跃订单的一次 tick。"""
         with self._paper_lock:
             order_tasks = list(self._paper_active_orders.items())
+        if order_tasks:
+            LOGGER.info(
+                "[纸面交易][TICK] session_id=%s thread=%s active_orders=%s",
+                self._session_id,
+                threading.current_thread().name,
+                [order_id for order_id, _ in order_tasks],
+            )
 
         finished: list[int] = []
         for order_id, account_key in order_tasks:
             events = self._simulator.tick(account_key, order_id)
             if events is not None:
+                LOGGER.info(
+                    "[纸面交易][TICK_EVENTS] session_id=%s thread=%s order_id=%s events=%s",
+                    self._session_id,
+                    threading.current_thread().name,
+                    order_id,
+                    [event.event_name for event in events],
+                )
                 self._emit_paper_events(events)
             if not self._simulator.is_order_active(account_key, order_id):
                 finished.append(order_id)
