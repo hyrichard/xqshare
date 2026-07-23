@@ -8,6 +8,7 @@ import os
 import ssl
 import threading
 import time
+from queue import Empty, Queue
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
@@ -318,6 +319,27 @@ class CallbackInfo:
     one_shot: bool = False
     registered_at: float = field(default_factory=time.time)
     call_count: int = 0
+    generation: int = 0
+    queue: Queue = field(default_factory=Queue)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    worker_thread: threading.Thread | None = None
+
+
+@dataclass
+class CallbackTask:
+    """服务端回调队列中的单条任务。"""
+
+    binding_id: str
+    generation: int
+    dispatcher: Any
+    kind: str
+    client_info: str
+    event_name: str | None = None
+    args: tuple = field(default_factory=tuple)
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+    one_shot: bool = False
+    registered_at: float = field(default_factory=time.time)
+    queued_at: float = field(default_factory=time.time)
 
 
 class CallbackManager:
@@ -325,11 +347,17 @@ class CallbackManager:
 
     def __init__(self):
         self._callbacks: Dict[str, CallbackInfo] = {}
+        self._binding_generations: Dict[str, int] = {}
         self._lock = threading.RLock()
 
     def register(self, binding_id: str, dispatcher, kind: str, client_info: str,
                  metadata: Optional[Dict[str, Any]] = None, one_shot: bool = False):
+        old_info = None
+        generation = 0
         with self._lock:
+            old_info = self._callbacks.pop(binding_id, None)
+            generation = self._binding_generations.get(binding_id, 0) + 1
+            self._binding_generations[binding_id] = generation
             self._callbacks[binding_id] = CallbackInfo(
                 binding_id=binding_id,
                 dispatcher=dispatcher,
@@ -337,12 +365,16 @@ class CallbackManager:
                 client_info=client_info,
                 metadata=metadata or {},
                 one_shot=one_shot,
+                generation=generation,
             )
+        if old_info is not None:
+            self._stop_callback_info(old_info)
         _log_callback_debug(
             "REGISTER",
             callback_id=binding_id,
             kind=kind,
             client=client_info,
+            generation=generation,
             one_shot=one_shot,
             metadata=_summarize_callback_value(metadata or {}),
         )
@@ -350,11 +382,13 @@ class CallbackManager:
     def unregister(self, binding_id: str):
         with self._lock:
             info = self._callbacks.pop(binding_id, None)
+        self._stop_callback_info(info)
         _log_callback_debug(
             "UNREGISTER",
             callback_id=binding_id,
             kind=getattr(info, "kind", None),
             client=getattr(info, "client_info", None),
+            generation=getattr(info, "generation", None),
         )
 
     def invoke(self, binding_id: str, *args, **kwargs):
@@ -364,46 +398,20 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
-            _log_callback_debug(
-                "FORWARD_START",
-                callback_id=binding_id,
+        self._enqueue_task(
+            info,
+            CallbackTask(
+                binding_id=binding_id,
+                generation=info.generation,
+                dispatcher=info.dispatcher,
                 kind=info.kind,
-                client=info.client_info,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
-        try:
-            result = info.dispatcher(binding_id, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_DONE",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
-            return result
-        except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_ERROR",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
-            raise
-        finally:
-            if info.one_shot:
-                self.unregister(binding_id)
+                client_info=info.client_info,
+                args=tuple(args),
+                kwargs=dict(kwargs),
+                one_shot=info.one_shot,
+            ),
+        )
+        return None
 
     def invoke_event(self, binding_id: str, event_name: str, *args, **kwargs):
         with self._lock:
@@ -412,46 +420,21 @@ class CallbackManager:
             return False
 
         info.call_count += 1
-        debug_enabled = _is_callback_debug_enabled()
-        start_time = None
-        if debug_enabled:
-            start_time = time.perf_counter()
-            _log_callback_debug(
-                "FORWARD_START",
-                callback_id=binding_id,
+        self._enqueue_task(
+            info,
+            CallbackTask(
+                binding_id=binding_id,
+                generation=info.generation,
+                dispatcher=info.dispatcher,
                 kind=info.kind,
-                client=info.client_info,
-                event=event_name,
-                payload=_summarize_callback_payload(args, kwargs),
-            )
-        try:
-            result = info.dispatcher(binding_id, event_name, *args, **kwargs)
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_DONE",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    result=_summarize_callback_value(result),
-                )
-            return result
-        except Exception as exc:
-            if debug_enabled:
-                elapsed_ms = (time.perf_counter() - start_time) * 1000
-                _log_callback_debug(
-                    "FORWARD_ERROR",
-                    callback_id=binding_id,
-                    kind=info.kind,
-                    client=info.client_info,
-                    event=event_name,
-                    cost_ms=f"{elapsed_ms:.2f}",
-                    error=type(exc).__name__,
-                    message=str(exc)[:200],
-                )
-            raise
+                client_info=info.client_info,
+                event_name=event_name,
+                args=tuple(args),
+                kwargs=dict(kwargs),
+                one_shot=info.one_shot,
+            ),
+        )
+        return None
 
     def list_callbacks(self):
         with self._lock:
@@ -468,10 +451,166 @@ class CallbackManager:
 
     def clear_client_callbacks(self, client_info: str):
         with self._lock:
-            to_remove = [binding_id for binding_id, info in self._callbacks.items() if info.client_info == client_info]
-            for binding_id in to_remove:
-                self._callbacks.pop(binding_id, None)
+            to_remove = [
+                binding_id
+                for binding_id, info in self._callbacks.items()
+                if info.client_info == client_info
+            ]
+        for binding_id in to_remove:
+            self.unregister(binding_id)
         return to_remove
+
+    def _enqueue_task(self, info: CallbackInfo, task: CallbackTask) -> None:
+        """把回调任务放入绑定级队列，并确保对应 worker 已启动。"""
+        self._ensure_worker(info)
+        _log_callback_debug(
+            "ENQUEUE",
+            callback_id=task.binding_id,
+            kind=task.kind,
+            client=task.client_info,
+            event=task.event_name,
+            generation=task.generation,
+            queue_size=info.queue.qsize(),
+            payload=_summarize_callback_payload(task.args, task.kwargs),
+        )
+        info.queue.put(task)
+
+    def _ensure_worker(self, info: CallbackInfo) -> None:
+        """确保单个回调绑定只有一个服务端派发 worker。"""
+        if info.worker_thread is not None and info.worker_thread.is_alive():
+            return
+        info.stop_event.clear()
+        worker = threading.Thread(
+            target=self._callback_worker_loop,
+            name=f"xqshare-server-callback-{info.binding_id}",
+            args=(info,),
+            daemon=True,
+        )
+        info.worker_thread = worker
+        worker.start()
+
+    def _callback_worker_loop(self, info: CallbackInfo) -> None:
+        """按 FIFO 顺序消费单个绑定的回调队列。"""
+        while True:
+            if info.stop_event.is_set():
+                try:
+                    task = info.queue.get_nowait()
+                except Empty:
+                    break
+            else:
+                try:
+                    task = info.queue.get(timeout=0.5)
+                except Empty:
+                    continue
+
+            if task is None:
+                info.queue.task_done()
+                break
+
+            start_time = time.perf_counter()
+            _log_callback_debug(
+                "DEQUEUE",
+                callback_id=task.binding_id,
+                kind=task.kind,
+                client=task.client_info,
+                event=task.event_name,
+                generation=task.generation,
+                queue_size=info.queue.qsize(),
+                payload=_summarize_callback_payload(task.args, task.kwargs),
+            )
+            if not self._is_current_generation(task.binding_id, task.generation):
+                _log_callback_debug(
+                    "STALE_DROP",
+                    callback_id=task.binding_id,
+                    kind=task.kind,
+                    client=task.client_info,
+                    event=task.event_name,
+                    generation=task.generation,
+                )
+                info.queue.task_done()
+                continue
+            try:
+                _log_callback_debug(
+                    "FORWARD_START",
+                    callback_id=task.binding_id,
+                    kind=task.kind,
+                    client=task.client_info,
+                    event=task.event_name,
+                    generation=task.generation,
+                    payload=_summarize_callback_payload(task.args, task.kwargs),
+                )
+                if task.event_name is None:
+                    result = task.dispatcher(task.binding_id, *task.args, **task.kwargs)
+                else:
+                    result = task.dispatcher(task.binding_id, task.event_name, *task.args, **task.kwargs)
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_DONE",
+                    callback_id=task.binding_id,
+                    kind=task.kind,
+                    client=task.client_info,
+                    event=task.event_name,
+                    generation=task.generation,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    result=_summarize_callback_value(result),
+                )
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - start_time) * 1000
+                _log_callback_debug(
+                    "FORWARD_ERROR",
+                    callback_id=task.binding_id,
+                    kind=task.kind,
+                    client=task.client_info,
+                    event=task.event_name,
+                    generation=task.generation,
+                    cost_ms=f"{elapsed_ms:.2f}",
+                    error=type(exc).__name__,
+                    message=str(exc)[:200],
+                )
+            finally:
+                info.queue.task_done()
+
+            if task.one_shot:
+                self.unregister(info.binding_id)
+                break
+
+    def _is_current_generation(self, binding_id: str, generation: int) -> bool:
+        """判断任务是否仍属于当前有效的回调代际。"""
+        with self._lock:
+            current_generation = self._binding_generations.get(binding_id, 0)
+        return generation == current_generation
+
+    def _stop_callback_info(self, info: CallbackInfo | None) -> None:
+        """停止指定绑定的服务端回调 worker，并丢弃尚未发送的任务。"""
+        if info is None:
+            return
+
+        info.stop_event.set()
+        drained = 0
+        while True:
+            try:
+                item = info.queue.get_nowait()
+            except Empty:
+                break
+            else:
+                drained += 1
+                info.queue.task_done()
+
+        info.queue.put(None)
+        _log_callback_debug(
+            "STOP",
+            callback_id=info.binding_id,
+            kind=info.kind,
+            client=info.client_info,
+            generation=info.generation,
+            queue_size=info.queue.qsize(),
+            drained=drained,
+        )
+
+        worker = info.worker_thread
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=2)
+        info.worker_thread = None
 
 
 class TraderCallbackAdapter(XtQuantTraderCallbackBase):
