@@ -13,7 +13,7 @@
   XQSHARE_REMOTE_PORT     - 服务端端口
   XQSHARE_CLIENT_SECRET   - 认证密钥
   QMT_ACCOUNT_ID      - 资金账号
-  QMT_USERDATA_PATH   - QMT客户端 userdata_mini 目录路径
+  QMT_USERDATA_PATH   - QMT客户端 userdata_mini 目录路径（可选，未设置时使用服务端配置）
 
 使用示例:
     # 使用环境变量配置（推荐）
@@ -224,25 +224,19 @@ def main():
     parser.add_argument("--account-type", default="STOCK",
                         choices=list(ACCOUNT_TYPES.keys()),
                         help=f"账户类型 (默认: STOCK)")
-    parser.add_argument("--path", help="QMT客户端 userdata_mini 目录路径 (默认: 环境变量 QMT_USERDATA_PATH)")
+    parser.add_argument("--path", help="QMT客户端 userdata_mini 目录路径 (默认: 环境变量 QMT_USERDATA_PATH；都未配置时使用服务端配置)")
 
     args = parser.parse_args()
 
     # 从环境变量读取私密配置
     account_id = args.account_id or os.environ.get("QMT_ACCOUNT_ID")
-    userdata_path = args.path or os.environ.get("QMT_USERDATA_PATH")
+    # 客户端未配置路径时传 None，由服务端的 QMT_USERDATA_PATH 提供
+    userdata_path = args.path or os.environ.get("QMT_USERDATA_PATH") or None
 
     if not account_id:
         print("错误: 必须提供资金账号")
         print("  方式1: 设置环境变量 QMT_ACCOUNT_ID")
         print("  方式2: 使用 --account-id 参数")
-        return
-
-    if not userdata_path:
-        print("错误: 必须提供 userdata_mini 目录路径")
-        print("  方式1: 设置环境变量 QMT_USERDATA_PATH")
-        print("  方式2: 使用 --path 参数")
-        print("  示例: --path \"C:\\\\QMT\\\\userdata_mini\"")
         return
 
     # 连接服务端（支持环境变量）
@@ -259,7 +253,7 @@ def main():
     try:
         # 创建交易实例
         print(f"正在创建交易实例...")
-        print(f"  路径: {userdata_path}")
+        print(f"  路径: {userdata_path or '<使用服务端 QMT_USERDATA_PATH>'}")
         trader = xt.create_trader(userdata_path)
 
         # 启动交易线程

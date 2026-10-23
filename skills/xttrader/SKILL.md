@@ -69,7 +69,7 @@ xttrader [全局参数] <command> [API参数]
 | `--secret` | XQSHARE_CLIENT_SECRET | 认证密钥 |
 | `--account-id` | QMT_ACCOUNT_ID | 资金账号 |
 | `--account-type` | - | 账户类型（默认 STOCK） |
-| `--userdata-path` | QMT_USERDATA_PATH | QMT userdata_mini 路径 |
+| `--userdata-path` | QMT_USERDATA_PATH | QMT userdata_mini 路径（可选，都未配置时使用服务端配置） |
 
 ## 账户类型
 

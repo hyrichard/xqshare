@@ -172,6 +172,7 @@ python examples/subscribe_quote.py --codes "000001.SZ" --duration 60
 ```bash
 # 设置交易相关环境变量
 export QMT_ACCOUNT_ID="12345678"
+# userdata_mini 路径可选：不设置时使用服务端 .env 的 QMT_USERDATA_PATH
 export QMT_USERDATA_PATH="C:\\QMT\\userdata_mini"
 
 # 查询持仓
@@ -246,7 +247,7 @@ from xqshare import XtQuantRemote
 
 with XtQuantRemote("192.168.1.100", client_secret="my-secret") as xt:
     # 创建交易实例（已自动 start）
-    # userdata_path 可通过环境变量 QMT_USERDATA_PATH 配置
+    # userdata_path 传 None 时使用服务端环境变量 QMT_USERDATA_PATH
     trader = xt.create_trader("C:\\QMT\\userdata_mini")
 
     # 创建账户对象

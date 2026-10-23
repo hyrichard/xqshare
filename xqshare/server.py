@@ -1037,10 +1037,11 @@ class XtQuantService(rpyc.Service):
             if not XTQUANT_AVAILABLE:
                 raise RuntimeError("xtquant 库未安装")
 
-            if userdata_path is None:
+            # 客户端未提供路径（None 或空字符串）时，使用服务端 .env / 环境变量中的 QMT_USERDATA_PATH
+            if not userdata_path:
                 userdata_path = os.environ.get("QMT_USERDATA_PATH")
-            if userdata_path is None:
-                raise ValueError("必须提供 userdata_path 参数或设置 QMT_USERDATA_PATH 环境变量")
+            if not userdata_path:
+                raise ValueError("必须提供 userdata_path 参数或在服务端设置 QMT_USERDATA_PATH 环境变量")
 
             trader = XtQuantTrader(userdata_path, session_id)
             logger.info(f"[创建Trader] mode=real | userdata_path={userdata_path} | session_id={session_id}")

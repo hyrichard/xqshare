@@ -402,7 +402,7 @@ def add_global_args(parser):
 
 def add_trader_args(parser):
     """添加交易相关参数"""
-    parser.add_argument("--userdata-path", help="QMT客户端 userdata_mini 目录路径 (环境变量: QMT_USERDATA_PATH)")
+    parser.add_argument("--userdata-path", help="QMT客户端 userdata_mini 目录路径 (环境变量: QMT_USERDATA_PATH；都未配置时使用服务端配置)")
     parser.add_argument("--account-id", help="资金账号 (环境变量: QMT_ACCOUNT_ID)")
     parser.add_argument("--account-type", default="STOCK", choices=["STOCK", "CREDIT", "FUTURE", "HUGANGTONG", "SHENGANGTONG"],
                         help="账户类型 (默认: STOCK)")
@@ -414,7 +414,7 @@ def create_trader(xt, userdata_path, account_id, account_type):
 
     Args:
         xt: XtQuantRemote 实例
-        userdata_path: userdata_mini 目录路径
+        userdata_path: userdata_mini 目录路径；客户端未配置时传 None，由服务端的 QMT_USERDATA_PATH 提供
         account_id: 资金账号
         account_type: 账户类型
 
@@ -424,13 +424,11 @@ def create_trader(xt, userdata_path, account_id, account_type):
     # 从环境变量获取默认值
     if not userdata_path:
         import os
-        userdata_path = os.environ.get("QMT_USERDATA_PATH")
+        userdata_path = os.environ.get("QMT_USERDATA_PATH") or None
     if not account_id:
         import os
         account_id = os.environ.get("QMT_ACCOUNT_ID")
 
-    if not userdata_path:
-        raise ValueError("必须提供 userdata_path 参数或设置 QMT_USERDATA_PATH 环境变量")
     if not account_id:
         raise ValueError("必须提供 account_id 参数或设置 QMT_ACCOUNT_ID 环境变量")
 
