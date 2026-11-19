@@ -1188,6 +1188,9 @@ class XtQuantService(rpyc.Service):
 
 # ==================== 服务启动 ====================
 
+# 行情后端环境变量：xtquant（默认，透传 xtquant.xtdata）或 local（读取大QMT 本机文件）
+XTDATA_BACKEND_ENV = "XQSHARE_XTDATA_BACKEND"
+
 def create_ssl_context(certfile=None, keyfile=None):
     if not certfile or not keyfile:
         return None
@@ -1216,12 +1219,33 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
     callback_debug_value = _get_callback_debug_value()
     callback_debug_enabled = _is_callback_debug_enabled()
 
+    # 行情后端：默认透传 xtquant.xtdata；local 时改为读取大QMT 本机文件（miniQMT 不可用时使用）
+    xtdata_backend = os.environ.get(XTDATA_BACKEND_ENV, "xtquant").strip().lower() or "xtquant"
+    if xtdata_backend == "local":
+        from .local_xtdata import LocalXtdata
+        try:
+            local_xtdata = LocalXtdata.from_env()
+        except ValueError as exc:
+            print(f"错误: {exc}")
+            return
+        XtQuantService._xtdata = local_xtdata
+        local_xtdata.run_self_check()
+        xtdata_backend_text = (f"本地文件 (datadir={local_xtdata.config.datadir}, "
+                               f"export={local_xtdata.config.export_dir}, "
+                               f"除权以 {local_xtdata.config.divid_source} 为准)")
+    elif xtdata_backend == "xtquant":
+        xtdata_backend_text = "xtquant"
+    else:
+        print(f"错误: {XTDATA_BACKEND_ENV} 只能是 xtquant 或 local，当前为 {xtdata_backend!r}")
+        return
+
     print("=" * 70)
     print("  XtQuant Share (xqshare) 服务")
     print("=" * 70)
     print(f"  监听地址: {host}:{port}")
     print(f"  SSL 加密: {'启用' if use_ssl else '禁用'}")
     print(f"  日志级别: {log_level}")
+    print(f"  行情后端: {xtdata_backend_text}")
     print(f"  交易后端: {'纸面交易' if is_paper_trader_mode() else '真实柜台'}")
     print(f"  Callback调试: {'启用' if callback_debug_enabled else '关闭'} "
           f"(XQSHARE_DEBUG_CALLBACK={callback_debug_value!r})")
@@ -1234,7 +1258,8 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
         f"服务启动 | host={host} | port={port} | ssl={use_ssl} | "
         f"callback_debug={callback_debug_enabled} | "
         f"XQSHARE_DEBUG_CALLBACK={callback_debug_value!r} | "
-        f"trader_mode={'paper' if is_paper_trader_mode() else 'real'} | env_file={env_file!r}"
+        f"trader_mode={'paper' if is_paper_trader_mode() else 'real'} | xtdata_backend={xtdata_backend} | "
+        f"env_file={env_file!r}"
     )
 
     config = {

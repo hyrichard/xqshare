@@ -372,6 +372,62 @@ xt = XtQuantRemote("192.168.1.100", log_level="DEBUG")
 
 ---
 
+## 本地行情模式（miniQMT 不可用时）
+
+miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT 的本地文件提供行情，客户端代码无需任何改动。
+
+### 数据流
+
+1. 大QMT 内置策略 `qmt_builtin/qmt_data_exporter.py`（GBK 编码，粘贴到大QMT 新建 Python 策略，点"运行"）每日定时：
+   - 调用 `download_history_data` 增量更新 datadir 中的日线；
+   - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）；
+   - 导出 `validation/front_ratio/` 自检样本；
+   - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）。
+2. xqshare 服务端读取：
+   - 日线：`<datadir>/<SH|SZ>/86400/<代码>.DAT`；
+   - 除权：导出的 `divid_factors.json` 与 `<datadir>/DividData`（定期复制到本地缓存后解析），按配置决定以哪个为准，
+     另一个作为补充，都没有时使用 DAT 自带的除权系数兜底；两个来源不一致时在服务端日志中告警；
+   - 板块、品种信息：导出的 JSON；
+   - 更新状态：`status.json` / `ready.json`，正在更新、更新失败或数据落后时在服务端日志中告警。
+
+启动时会用 `validation/front_ratio/` 对照本地前复权计算结果，误差超过 1e-6 时告警。
+
+### 环境变量
+
+| 环境变量 | 说明 | 默认值 |
+|------|------|--------|
+| XQSHARE_XTDATA_BACKEND | 行情后端：`xtquant`（透传 xtquant.xtdata）或 `local`（读取本地文件） | xtquant |
+| XQSHARE_QMT_DATADIR | 大QMT datadir 目录，local 模式必填 | - |
+| XQSHARE_QMT_EXPORT_DIR | 内置策略输出目录（与策略中 `EXPORT_ROOT` 一致），local 模式必填 | - |
+| XQSHARE_DIVID_SOURCE | 除权以哪个来源为准：`export`（导出 JSON，含盘中修正）或 `dividdata`（DividData） | export |
+| XQSHARE_DIVID_CACHE_DIR | DividData 复制到的本地缓存目录 | cache |
+
+示例（服务端 `.env`）：
+
+```bash
+XQSHARE_XTDATA_BACKEND=local
+XQSHARE_QMT_DATADIR=E:\swhyqmt\datadir
+XQSHARE_QMT_EXPORT_DIR=E:\swhyqmt\export
+XQSHARE_DIVID_SOURCE=export
+```
+
+### 支持范围
+
+| 接口 | 说明 |
+|------|------|
+| get_market_data_ex | 仅 `period="1d"`；`dividend_type` 支持 `none` / `front_ratio`；`fill_data` 不生效 |
+| get_divid_factors | 返回 DataFrame，index 为除权日 `YYYYMMDD` |
+| get_stock_list_in_sector / get_sector_list | 内置策略导出的板块（沪深A股、上证A股、深证A股、创业板、科创板、沪深ETF、沪深指数） |
+| get_instrument_detail / get_instrument_detail_list | 内置策略导出的品种信息 |
+| get_full_tick | 没有实时行情：只返回最后一根日线为今天的品种（收盘更新后可用），不含五档盘口 |
+| download_history_data / download_history_data2 | 空操作，数据由大QMT 内置策略更新 |
+
+其他 xtdata 接口（订阅、分钟线、财务数据等）在本地模式下会直接报错"本地行情模式不支持"。
+
+本地模式没有盘中实时价格，纸面交易（`XQSHARE_TRADER_MODE=paper`）在盘中取不到成交参考价，市价单会被拒绝。
+
+---
+
 ## 认证机制
 
 服务端和客户端需要配置相同的密钥，详见上方"环境变量配置"。
