@@ -13,6 +13,7 @@
     1. 写 status.json（state=running），告诉 xqshare 正在更新 DAT；
     2. 取板块成份，确定品种池（沪深A股 + 沪深ETF + 沪深指数）；
     3. download_history_data 逐只增量补日线到 datadir（xqshare 读的就是这些 DAT）；
+       内置 xtdata.download_financial_data 增量下载股本表到 datadir/Finance（xqshare 直接解析）；
     4. 检查最新交易日：取全市场最后一根日线，统计已更新到最新交易日的品种数；
     5. 导出 DAT 之外的数据（xqshare 不直接解析这些格式）：
        - meta/sectors.json        板块成份
@@ -77,6 +78,12 @@ VALIDATE_CODES = ["510300.SH", "159915.SZ", "600519.SH", "601318.SH", "300750.SZ
 
 # 自检导出字段
 VALIDATE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
+
+# 股本表下载范围：只有股票有股本数据
+CAPITAL_SECTOR = "沪深A股"
+
+# 股本表每批下载的股票数量
+CAPITAL_BATCH_SIZE = 100
 
 # ======================= 全局状态 =======================
 
@@ -144,6 +151,7 @@ def run_update(C, trigger):
         check = run_step(status, "check", lambda: check_latest(C, universe)) or {}
         run_step(status, "divid_factors", lambda: export_divid_factors(C, universe))
         run_step(status, "instruments", lambda: export_instruments(C, universe))
+        run_step(status, "capital", lambda: download_capital(sectors))
         run_step(status, "validation", lambda: export_validation(C))
 
         status["trade_date"] = check.get("trade_date", "")
@@ -291,6 +299,31 @@ def export_divid_factors(C, universe):
             result[code] = [[int(k)] + list(v) for k, v in sorted(raw.items(), key=lambda kv: int(kv[0]))]
     write_json("meta/divid_factors.json", result)
     return {"codes_with_events": len(result), "failed": len(failed), "failed_sample": failed[:20]}
+
+
+def download_capital(sectors):
+    """增量下载股本表（Capital）到 datadir/Finance，xqshare 直接解析 <代码>_7004.DAT。
+
+    财务数据只能通过大QMT 内置环境中的 xtquant.xtdata 下载（外部进程无权限连接 xtdata 服务）。
+    下载失败不影响后续步骤，xqshare 继续读取本地已有的股本数据。
+    """
+    import xtquant.xtdata as xtdata
+    xtdata.enable_hello = False
+    codes = sorted(sectors.get(CAPITAL_SECTOR, []))
+    if not codes:
+        raise RuntimeError("板块 {} 成份为空".format(CAPITAL_SECTOR))
+    failed = 0
+    last_error = ""
+    for start in range(0, len(codes), CAPITAL_BATCH_SIZE):
+        batch = codes[start:start + CAPITAL_BATCH_SIZE]
+        try:
+            xtdata.download_financial_data(batch, ["Capital"])
+        except Exception as exc:
+            failed += len(batch)
+            last_error = repr(exc)
+        if (start // CAPITAL_BATCH_SIZE + 1) % 10 == 0:
+            log("capital 进度 {}/{}".format(min(start + CAPITAL_BATCH_SIZE, len(codes)), len(codes)))
+    return {"codes": len(codes), "failed": failed, "last_error": last_error}
 
 
 def export_instruments(C, universe):

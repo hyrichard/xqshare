@@ -11,12 +11,14 @@
        - dividdata：<datadir>/DividData（LevelDB，客户端启动时更新），定期复制到本地缓存目录后解析；
        - DAT 兜底：K 线记录中自带的单日除权系数，只有 dr 没有明细；
     3. 板块成份、品种信息：<export>/meta/sectors.json、instruments.json；
+       股本表：<datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT；
     4. 更新状态：<export>/status.json、ready.json，用于判断数据是否已更新到最新交易日。
 
 支持的接口：
     get_market_data_ex（仅 1d，dividend_type 支持 none / front_ratio）、get_divid_factors、
     get_stock_list_in_sector、get_sector_list、get_instrument_detail、get_instrument_detail_list、
-    get_full_tick（用当日已收盘日线近似）、download_history_data / download_history_data2（空操作）。
+    get_financial_data（仅 Capital 股本表）、get_full_tick（用当日已收盘日线近似）、
+    download_history_data / download_history_data2（空操作）。
 
 前复权算法（已与 QMT 的 front_ratio 结果逐 bar 对照一致）：
     每个除权事件映射到不早于除权日的第一根 bar（停牌期间的除权顺延到复牌日），
@@ -72,6 +74,14 @@ DAT_DTYPE = np.dtype({
     "itemsize": 64,
 })
 BEIJING_OFFSET_SECONDS = 8 * 3600
+
+# 股本表 DAT：无文件头，每期 56 字节（已与内置 xtdata.get_financial_data 逐字段对照一致）；
+# 两个日期为北京时间 0 点的毫秒时间戳，股本单位为股
+CAPITAL_DTYPE = np.dtype([
+    ("m_timetag", "<i8"), ("m_anntime", "<i8"), ("total_capital", "<f8"), ("circulating_capital", "<f8"),
+    ("restrict_circulating_capital", "<f8"), ("freeFloatCapital", "<f8"), ("m_quarter", "<i8"),
+])
+CAPITAL_COLUMNS = list(CAPITAL_DTYPE.names)
 
 # 单个除权事件：(毫秒时间, 每股红利, 送股, 转增, 配股, 配股价, 股改标志, dr)
 DividEvent = Tuple[int, float, float, float, float, float, int, float]
@@ -604,6 +614,68 @@ class LocalXtdata:
                            f"当前以 {self.config.divid_source} 为准")
         else:
             logger.info(f"[本地行情] 除权来源一致: 品种数={len(export_events)}")
+
+    # ---------- 财务数据 ----------
+
+    def get_financial_data(self, stock_list: Sequence[str], table_list: Sequence[str] = (), start_time: Any = "",
+                           end_time: Any = "", report_type: str = "report_time") -> Dict[str, Dict[str, pd.DataFrame]]:
+        """返回财务数据 {代码: {表名: DataFrame}}，目前只支持股本表 Capital。
+
+        直接解析 <datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT（由内置策略调用 download_financial_data 更新），
+        DataFrame 列与 xtdata 一致，m_timetag（报告截止日）/ m_anntime（公告日）为 YYYYMMDD 字符串。
+
+        Args:
+            stock_list: 代码列表；没有股本数据的代码返回空 DataFrame（与 xtdata 一致）。
+            table_list: 表名列表，支持 Capital（大小写不敏感，也接受 CAPITALSTRUCTURE）；为空时只返回 Capital。
+            start_time / end_time: 闭区间日期过滤。
+            report_type: report_time 按报告截止日过滤，announce_time 按公告日过滤。
+
+        Raises:
+            ValueError: 请求了 Capital 以外的表，或 report_type 非法。
+        """
+        tables = list(table_list) or ["Capital"]
+        unsupported = [t for t in tables if str(t).upper() not in ("CAPITAL", "CAPITALSTRUCTURE")]
+        if unsupported:
+            raise ValueError(f"本地行情模式的 get_financial_data 只支持 Capital 表，收到 {unsupported}")
+        if report_type not in ("report_time", "announce_time"):
+            raise ValueError(f"report_type 只能是 report_time 或 announce_time，收到 {report_type!r}")
+        start, end = _normalize_date(start_time), _normalize_date(end_time)
+        date_column = "m_timetag" if report_type == "report_time" else "m_anntime"
+        result: Dict[str, Dict[str, pd.DataFrame]] = {}
+        for code in stock_list:
+            frame = self._capital_frame(code)
+            if start:
+                frame = frame[frame[date_column] >= start]
+            if end:
+                frame = frame[frame[date_column] <= end]
+            frame = frame.reset_index(drop=True)
+            result[code] = {table: frame.copy() for table in tables}  # 键名沿用调用方写法，与 xtdata 一致
+        return result
+
+    def _capital_frame(self, code: str) -> pd.DataFrame:
+        """读取单只股票的股本表 DAT，转换为 xtdata 的 Capital DataFrame；文件不存在时返回空表。"""
+        parts = str(code).split(".")
+        path = None
+        if len(parts) == 2:
+            path = os.path.join(self.config.datadir, "Finance", parts[1].upper(), "86400", f"{parts[0]}_7004.DAT")
+        if path is None or not os.path.exists(path):
+            return pd.DataFrame(columns=CAPITAL_COLUMNS)
+        with open(path, "rb") as fh:
+            buf = fh.read()
+        records = np.frombuffer(buf, CAPITAL_DTYPE, count=len(buf) // CAPITAL_DTYPE.itemsize)
+        timetag = records["m_timetag"].astype("int64")
+        anntime = records["m_anntime"].astype("int64")
+        anntime = np.where(anntime > 0, anntime, timetag)  # 与 xtdata 一致：缺公告日时用报告截止日
+        frame = pd.DataFrame({
+            "m_timetag": _bar_dates(timetag // 1000),
+            "m_anntime": _bar_dates(anntime // 1000),
+            "total_capital": records["total_capital"],
+            "circulating_capital": records["circulating_capital"],
+            "restrict_circulating_capital": records["restrict_circulating_capital"],
+            "freeFloatCapital": records["freeFloatCapital"],
+            "m_quarter": records["m_quarter"].astype("float64"),
+        }, columns=CAPITAL_COLUMNS)
+        return frame
 
     # ---------- 板块与品种信息 ----------
 

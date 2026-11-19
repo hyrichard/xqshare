@@ -408,3 +408,61 @@ class TestReviewRegressions:
         os.makedirs(folder)
         pd.DataFrame({"date": ["20260105"], "close": [1.0]}).to_csv(os.path.join(folder, "600000.SH.csv"), index=False)
         assert LocalXtdata(config).run_self_check() == {"600000.SH": float("inf")}
+
+
+# ==================== 财务数据（股本表） ====================
+
+CAPITAL_COLUMNS = local_xtdata.CAPITAL_COLUMNS
+
+
+def write_capital_dat(datadir, code: str, rows: list) -> None:
+    """写股本表 DAT：rows 为 [(报告截止日, 公告日, 总股本, 流通, 限售, 自由流通, m_quarter)]，公告日为 None 写 0。"""
+    number, market = code.split(".")
+    folder = os.path.join(str(datadir), "Finance", market, "86400")
+    os.makedirs(folder, exist_ok=True)
+    records = np.zeros(len(rows), dtype=local_xtdata.CAPITAL_DTYPE)
+    for i, (report, announce, total, circ, restrict, free, quarter) in enumerate(rows):
+        records[i] = (_day_ms(report), _day_ms(announce) if announce else 0, total, circ, restrict, free, quarter)
+    with open(os.path.join(folder, f"{number}_7004.DAT"), "wb") as fh:
+        fh.write(records.tobytes())
+
+
+class TestFinancialData:
+    @pytest.fixture
+    def capital_env(self, env):
+        datadir, _, config = env
+        write_capital_dat(datadir, "600000.SH", [
+            ("20250331", "20250420", 1e9, 9e8, 0.0, 5e8, 1),
+            ("20250630", "20250815", 1.1e9, float("nan"), 0.0, 5.5e8, 2),
+            ("20250930", None, 1.1e9, 1e9, 0.0, 5.5e8, 3),
+        ])
+        return LocalXtdata(config)
+
+    def test_capital_frame_format(self, capital_env):
+        result = capital_env.get_financial_data(["600000.SH", "510300.SH"], ["Capital"])
+        frame = result["600000.SH"]["Capital"]
+        assert list(frame.columns) == CAPITAL_COLUMNS and len(frame) == 3
+        assert frame["m_timetag"].tolist() == ["20250331", "20250630", "20250930"]
+        assert frame["m_anntime"].tolist() == ["20250420", "20250815", "20250930"]  # 缺公告日时用截止日
+        assert np.isnan(frame["circulating_capital"].iloc[1]) and frame["total_capital"].dtype == np.float64
+        assert frame["m_quarter"].tolist() == [1.0, 2.0, 3.0]
+        assert result["510300.SH"]["Capital"].empty and list(result["510300.SH"]["Capital"].columns) == CAPITAL_COLUMNS
+
+    def test_capital_filter_by_report_type(self, capital_env):
+        by_report = capital_env.get_financial_data(["600000.SH"], ["Capital"], "20250601", "20250731")
+        assert by_report["600000.SH"]["Capital"]["m_timetag"].tolist() == ["20250630"]
+        by_announce = capital_env.get_financial_data(["600000.SH"], ["Capital"], "20250401", "20250430",
+                                                     report_type="announce_time")
+        assert by_announce["600000.SH"]["Capital"]["m_anntime"].tolist() == ["20250420"]
+
+    def test_table_names(self, capital_env):
+        assert list(capital_env.get_financial_data(["600000.SH"], ["CAPITALSTRUCTURE"])["600000.SH"]) == [
+            "CAPITALSTRUCTURE"]
+        assert list(capital_env.get_financial_data(["600000.SH"])["600000.SH"]) == ["Capital"]
+        with pytest.raises(ValueError, match="只支持 Capital"):
+            capital_env.get_financial_data(["600000.SH"], ["Balance"])
+
+    def test_missing_capital_file(self, env):
+        _, _, config = env
+        frame = LocalXtdata(config).get_financial_data(["600000.SH"], ["Capital"])["600000.SH"]["Capital"]
+        assert frame.empty and list(frame.columns) == CAPITAL_COLUMNS
