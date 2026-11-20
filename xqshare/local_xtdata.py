@@ -621,7 +621,7 @@ class LocalXtdata:
                            end_time: Any = "", report_type: str = "report_time") -> Dict[str, Dict[str, pd.DataFrame]]:
         """返回财务数据 {代码: {表名: DataFrame}}，目前只支持股本表 Capital。
 
-        直接解析 <datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT（由内置策略调用 download_financial_data 更新），
+        直接解析 <datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT（由内置策略调用 download_history_data(代码, "Capital") 更新），
         DataFrame 列与 xtdata 一致，m_timetag（报告截止日）/ m_anntime（公告日）为 YYYYMMDD 字符串。
 
         Args:

@@ -3,17 +3,17 @@
 大QMT 内置 Python 数据维护脚本（xqshare 数据源）。
 
 所属层次：
-    运行在大QMT 内置 Python 中的每日数据维护任务，为 xqshare 服务端准备数据。
+    运行在大QMT 内置 Python 中的每日数据维护任务，为 xqshare 服务端准备数据（日线 + 财务数据）。
+    只使用大QMT 内置接口，不 import xtquant，不使用线程或进程。
 
 背景：
     miniQMT 已关闭，外部 xtdata 无法连接。xqshare 服务端改为直接读取 datadir 下的 DAT 日线文件。
     大QMT 内置 Python 以后可能被禁止读取外部文件，但仍可写文件，因此本脚本只写不读。
 
-主要流程（每个交易日收盘后执行一次）：
+主要流程（大QMT 启动时执行一次，每天 SCHEDULE_TIME 盘后再执行一次）：
     1. 写 status.json（state=running），告诉 xqshare 正在更新 DAT；
     2. 取板块成份，确定品种池（沪深A股 + 沪深ETF + 沪深指数）；
     3. download_history_data 逐只增量补日线到 datadir（xqshare 读的就是这些 DAT）；
-       内置 xtdata.download_financial_data 增量下载股本表到 datadir/Finance（xqshare 直接解析）；
     4. 检查最新交易日：取全市场最后一根日线，统计已更新到最新交易日的品种数；
     5. 导出 DAT 之外的数据（xqshare 不直接解析这些格式）：
        - meta/sectors.json        板块成份
@@ -21,10 +21,17 @@
        - meta/divid_factors.json  除权明细（DividData 是 LevelDB，QMT 运行时加锁，外部不便读取）
     6. 导出少量品种的 QMT front_ratio 结果到 validation/，供 xqshare 自检 DAT 解析与复权口径；
     7. 写 status.json（state=done/failed）；全部成功时再写 ready.json 作为"已更新好"的标记。
-       盘中启动执行时当日 K 线未收盘，不写 ready.json，由当天 SCHEDULE_TIME 的定时任务补上。
+       盘中启动执行时当日 K 线未收盘，不写 ready.json，由当天 SCHEDULE_TIME 的定时任务补上；
+    8. 日线部分结束后，逐只调用 download_history_data(代码, 表名, "", "") 下载 FINANCIAL_TABLES 财务表到 datadir
+       （xqshare 直接解析 Finance/<SH|SZ>/86400/<代码>_7004.DAT）。每只股票整表重新下载，
+       实测沪深A股 5224 只股本表约 66 秒、0 失败。结果只记入 status.json 的 financial 字段和日志，
+       不改变 state，也不影响 ready.json。
+
+单线程限制（官方文档）：
+    所有内置策略在同一个线程中执行，本脚本运行期间（约 5~7 分钟）其他内置策略暂停，因此每天只运行两次。
 
 输出目录结构（EXPORT_ROOT）：
-    status.json                最近一次运行状态：state 为 running / done / failed，含各步骤结果
+    status.json                最近一次运行状态：state 为 running / done / failed，含各步骤结果和 financial 财务下载结果
     ready.json                 最近一次成功运行：{"trade_date": "YYYYMMDD", "finished_at": ..., ...}
     meta/sectors.json          {板块名: [代码, ...]}
     meta/instruments.json      {代码: get_instrument_detail 结果}
@@ -42,6 +49,7 @@ xqshare 读取约定：
     1. 修改下方"手动配置区"（主要是 EXPORT_ROOT 和 SCHEDULE_TIME）；
     2. 大QMT 新建 Python 策略，粘贴全部内容，主图任选股票、日线，点"运行"（不要点"回测"）；
     3. 策略保持运行状态，每天 SCHEDULE_TIME 自动执行；RUN_ON_START=True 时启动后立即执行一次。
+    4. 不再需要单独的财务下载策略（原 qmt_financial_downloader.py 已合并到本脚本）。
 """
 
 import datetime
@@ -58,7 +66,7 @@ EXPORT_ROOT = r"E:\swhyqmt\export"
 # 每日定时执行时间（债券/货币 ETF 交易到 15:30，留出日线落地时间）
 SCHEDULE_TIME = "15:45:00"
 
-# 策略启动后是否立即执行一次（首次部署、补跑时用）
+# 策略启动后是否立即执行一次（大QMT 每天启动时补齐数据）
 RUN_ON_START = True
 
 # 品种池来源板块：品种池 = 这些板块成份的并集
@@ -79,11 +87,11 @@ VALIDATE_CODES = ["510300.SH", "159915.SZ", "600519.SH", "601318.SH", "300750.SZ
 # 自检导出字段
 VALIDATE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
 
-# 股本表下载范围：只有股票有股本数据
-CAPITAL_SECTOR = "沪深A股"
-
-# 股本表每批下载的股票数量
-CAPITAL_BATCH_SIZE = 100
+# 财务数据：下载范围板块（只有股票有财务数据）与财务表；FINANCIAL_TABLES 为空列表时不下载财务数据
+# 可选表：Balance / Income / CashFlow / Capital / HolderNum / Top10Holder / Top10FlowHolder / PershareIndex
+# xqshare 目前只解析 Capital；每多一张表，下载时间约增加一倍
+FINANCIAL_SECTOR = "沪深A股"
+FINANCIAL_TABLES = ["Capital"]
 
 # ======================= 全局状态 =======================
 
@@ -129,7 +137,7 @@ def scheduled_job(C):
 # ======================= 主流程 =======================
 
 def run_update(C, trigger):
-    """执行一次完整更新：先标记 running，结束时写 status.json，成功时写 ready.json。"""
+    """执行一次完整更新：先标记 running，日线部分结束时写 status.json / ready.json，然后下载财务数据。"""
     global _RUNNING
     if _RUNNING:
         log("上一次更新仍在进行，跳过")
@@ -151,7 +159,6 @@ def run_update(C, trigger):
         check = run_step(status, "check", lambda: check_latest(C, universe)) or {}
         run_step(status, "divid_factors", lambda: export_divid_factors(C, universe))
         run_step(status, "instruments", lambda: export_instruments(C, universe))
-        run_step(status, "capital", lambda: download_capital(sectors))
         run_step(status, "validation", lambda: export_validation(C))
 
         status["trade_date"] = check.get("trade_date", "")
@@ -161,11 +168,14 @@ def run_update(C, trigger):
         log("更新异常:\n" + status["error"])
     finally:
         try:
-            finish_update(status, begin)
-        except Exception:
-            log("写入运行状态失败:\n" + traceback.format_exc())
+            try:
+                finish_update(status, begin)
+            except Exception:
+                log("写入运行状态失败:\n" + traceback.format_exc())
+            # 财务数据放在 ready.json 之后：失败或耗时都不影响 xqshare 判断日线是否就绪
+            update_financial(C, status)
         finally:
-            # 无论状态文件是否写成功都要复位，否则之后每天的定时任务都会被当成"仍在进行"而跳过
+            # 无论上面是否出错都要复位，否则之后每天的定时任务都会被当成"仍在进行"而跳过
             _RUNNING = False
 
 
@@ -192,8 +202,29 @@ def finish_update(status, begin):
         log("盘中执行：当日 K 线尚未收盘，不更新 ready.json，等待 {} 定时执行".format(SCHEDULE_TIME))
     if status["ok"] and after_schedule:
         _LAST_RUN_DATE = today
-    log("===== 更新结束 state={} trade_date={} 用时 {}s =====".format(
+    log("===== 日线更新结束 state={} trade_date={} 用时 {}s =====".format(
         status["state"], status.get("trade_date", ""), status["seconds"]))
+
+
+def update_financial(C, status):
+    """下载财务数据，结果写入 status["financial"] 后重写 status.json；不改变 state，也不改动 ready.json。"""
+    if not FINANCIAL_TABLES:
+        return
+    begin = time.time()
+    log("===== 开始下载财务数据: 板块 {} 表 {} =====".format(FINANCIAL_SECTOR, FINANCIAL_TABLES))
+    try:
+        info = download_financial(C)
+        status["financial"] = dict(ok=True, seconds=round(time.time() - begin, 1), **info)
+        log("[OK] financial {}".format(info))
+    except Exception:
+        status["financial"] = {"ok": False, "seconds": round(time.time() - begin, 1),
+                               "error": traceback.format_exc()}
+        log("[FAIL] financial\n{}".format(status["financial"]["error"]))
+    try:
+        write_json("status.json", status)
+    except Exception:
+        log("写入财务下载结果失败:\n" + traceback.format_exc())
+    log("===== 财务数据下载结束 用时 {}s =====".format(status["financial"]["seconds"]))
 
 
 def run_step(status, name, func):
@@ -262,6 +293,24 @@ def download_klines(universe):
     return {"total": len(universe), "failed": len(failed), "failed_sample": failed[:20]}
 
 
+def download_financial(C):
+    """逐只、逐表下载财务数据到 datadir；表名作为周期传给内置 download_history_data，单只失败继续。"""
+    codes = sorted(C.get_stock_list_in_sector(FINANCIAL_SECTOR) or [])
+    if not codes:
+        raise RuntimeError("板块 {} 成份为空".format(FINANCIAL_SECTOR))
+    failed = []
+    for idx, code in enumerate(codes, 1):
+        for table in FINANCIAL_TABLES:
+            try:
+                download_history_data(code, table, "", "")  # noqa: F821 内置全局函数，表名作为周期
+            except Exception as exc:
+                failed.append("{} {}: {!r}".format(code, table, exc))
+        if idx % 1000 == 0:
+            log("financial 进度 {}/{}".format(idx, len(codes)))
+    return {"total": len(codes), "tables": list(FINANCIAL_TABLES), "failed": len(failed),
+            "failed_sample": failed[:20]}
+
+
 def check_latest(C, universe):
     """确定最新交易日，并统计最后一根日线已到该日的品种数（停牌/未上市品种不会到）。"""
     cal = fetch_klines(C, [CALENDAR_CODE], ["time"], count=1).get(CALENDAR_CODE)
@@ -299,31 +348,6 @@ def export_divid_factors(C, universe):
             result[code] = [[int(k)] + list(v) for k, v in sorted(raw.items(), key=lambda kv: int(kv[0]))]
     write_json("meta/divid_factors.json", result)
     return {"codes_with_events": len(result), "failed": len(failed), "failed_sample": failed[:20]}
-
-
-def download_capital(sectors):
-    """增量下载股本表（Capital）到 datadir/Finance，xqshare 直接解析 <代码>_7004.DAT。
-
-    财务数据只能通过大QMT 内置环境中的 xtquant.xtdata 下载（外部进程无权限连接 xtdata 服务）。
-    下载失败不影响后续步骤，xqshare 继续读取本地已有的股本数据。
-    """
-    import xtquant.xtdata as xtdata
-    xtdata.enable_hello = False
-    codes = sorted(sectors.get(CAPITAL_SECTOR, []))
-    if not codes:
-        raise RuntimeError("板块 {} 成份为空".format(CAPITAL_SECTOR))
-    failed = 0
-    last_error = ""
-    for start in range(0, len(codes), CAPITAL_BATCH_SIZE):
-        batch = codes[start:start + CAPITAL_BATCH_SIZE]
-        try:
-            xtdata.download_financial_data(batch, ["Capital"])
-        except Exception as exc:
-            failed += len(batch)
-            last_error = repr(exc)
-        if (start // CAPITAL_BATCH_SIZE + 1) % 10 == 0:
-            log("capital 进度 {}/{}".format(min(start + CAPITAL_BATCH_SIZE, len(codes)), len(codes)))
-    return {"codes": len(codes), "failed": failed, "last_error": last_error}
 
 
 def export_instruments(C, universe):

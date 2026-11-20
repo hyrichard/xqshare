@@ -378,12 +378,16 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
 
 ### 数据流
 
-1. 大QMT 内置策略 `qmt_builtin/qmt_data_exporter.py`（GBK 编码，粘贴到大QMT 新建 Python 策略，点"运行"）每日定时：
+1. 大QMT 内置策略 `qmt_builtin/qmt_data_exporter.py`（GBK 编码，粘贴到大QMT 新建 Python 策略，点"运行"）
+   在大QMT 启动时执行一次、每天盘后 `SCHEDULE_TIME` 再执行一次（只用大QMT 内置接口，不 import xtquant、不使用线程）：
    - 调用 `download_history_data` 增量更新 datadir 中的日线；
    - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）；
-   - 调用内置环境中的 `xtdata.download_financial_data` 增量下载股本表到 datadir（外部进程无权限连接大QMT 的 xtdata 服务）；
    - 导出 `validation/front_ratio/` 自检样本；
-   - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）。
+   - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）；
+   - 日线部分结束后，逐只调用 `download_history_data(代码, "Capital", "", "")` 下载股本表到 datadir
+     （配置项 `FINANCIAL_TABLES`，实测沪深A股 5224 只约 66 秒）；结果记入 `status.json` 的 `financial` 字段，
+     不影响 `state` 和 `ready.json`；
+   - 大QMT 所有内置策略共用一个线程，脚本运行期间（约 5~7 分钟）其他内置策略暂停。
 2. xqshare 服务端读取：
    - 日线：`<datadir>/<SH|SZ>/86400/<代码>.DAT`；
    - 除权：导出的 `divid_factors.json` 与 `<datadir>/DividData`（定期复制到本地缓存后解析），按配置决定以哪个为准，
