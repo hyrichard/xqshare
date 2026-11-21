@@ -383,7 +383,7 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
    - 调用 `download_history_data` 增量更新 datadir 中的日线；
    - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）、
      `meta/trading_dates.json`（交易日历，导出失败不影响 `ready.json`，沿用上次的文件）；
-   - 导出 `validation/front_ratio/` 自检样本；
+   - 导出 `validation/<复权类型>/` 复权样本（front_ratio / back_ratio / front / back，QMT 原值）；
    - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）；
    - 日线部分结束后，逐只调用 `download_history_data(代码, "Capital", "", "")` 下载股本表到 datadir
      （配置项 `FINANCIAL_TABLES`，实测沪深A股 5224 只约 66 秒）；结果记入 `status.json` 的 `financial` 字段，
@@ -692,6 +692,10 @@ state = xt.get_update_status()
 # 批量取除权数据：一次远程调用返回 {代码: DataFrame}，避免逐只调用 get_divid_factors
 # index 为除权日 YYYYMMDD 字符串；没有除权的代码为空 DataFrame；服务端取数出错的代码不在结果中（服务端日志有记录）
 factors = xt.get_divid_factors_batch(["600000.SH", "510300.SH"])
+
+# QMT 复权样本：{代码: DataFrame}，用于核对自己计算的复权结果
+# 本地行情模式返回内置策略导出的 validation 样本（stock_list 为空时返回全部）；xtquant 模式必须指定 stock_list
+samples = xt.get_adjust_samples("front", stock_list=["600519.SH"])
 ```
 
 ---
@@ -700,6 +704,7 @@ factors = xt.get_divid_factors_batch(["600000.SH", "510300.SH"])
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 2.0.4 | 2026-11-22 | 本地模式支持交易日历；新增同步辅助接口；内置脚本导出交易日历和四种复权样本 |
 | 2.0.1 | 2026-10-24 | 客户端未提供 userdata_path 时统一使用服务端 `QMT_USERDATA_PATH`，客户端可不配置该路径 |
 | 2.0.0 | 2026-10-23 | 版本号升级为 2.0.0，作者新增 hyrichard |
 | 1.1.1 | 2026-03-18 | 新增 xtview 模块支持（视图控制、调度任务管理），兼容不同 xtquant 版本 |

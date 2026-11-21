@@ -347,6 +347,21 @@ class TestMetaAndStatus:
         assert result["ready"]["trade_date"] == "29991231"
         assert result["message"].startswith("数据已就绪")
 
+    def test_adjust_samples(self, env):
+        _, export, config = env
+        folder = export / "validation" / "front"
+        folder.mkdir(parents=True)
+        (folder / "600000.SH.csv").write_text("date,time,close\n20260107,1767715200000,9.5\n", encoding="utf-8")
+        (folder / "510300.SH.csv").write_text("date,time,close\n20260107,1767715200000,4.0\n", encoding="utf-8")
+        xt = LocalXtdata(config)
+        samples = xt.get_adjust_samples("front")
+        assert set(samples) == {"600000.SH", "510300.SH"}
+        assert samples["600000.SH"].index.tolist() == ["20260107"]
+        assert set(xt.get_adjust_samples("front", ["510300.SH"])) == {"510300.SH"}
+        assert xt.get_adjust_samples("back") == {}
+        with pytest.raises(ValueError):
+            xt.get_adjust_samples("none")
+
     def test_trading_dates_from_export(self, env):
         _, export, config = env
         x = LocalXtdata(config)

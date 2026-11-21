@@ -1223,6 +1223,24 @@ class XtQuantRemote:
             frame.index = frame.index.astype(str)
         return result
 
+    def get_adjust_samples(self, dividend_type: str = "front_ratio", stock_list: Optional[list] = None) -> dict:
+        """取 QMT 复权样本，返回 {代码: DataFrame}（index 为日期 YYYYMMDD 字符串），供核对自算的复权结果。
+
+        本地行情模式返回大QMT 内置策略导出的样本（stock_list 为空时返回全部样本代码）；
+        xtquant 模式直接取 stock_list 的完整复权日线，必须指定 stock_list。
+
+        Args:
+            dividend_type: front_ratio / back_ratio / front / back。
+            stock_list: 代码列表。
+        """
+        self._ensure_connected()
+        codes = tuple(str(code) for code in (stock_list or ()))
+        result = _deserialize_from_transfer(self._conn.root.get_adjust_samples(dividend_type, codes))
+        for frame in result.values():
+            # CSV 传输后 index 会被解析成整数，转回日期字符串
+            frame.index = frame.index.astype(str)
+        return result
+
     def is_connected(self):
         return self._connected
 

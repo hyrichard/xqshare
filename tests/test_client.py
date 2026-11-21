@@ -325,3 +325,19 @@ class TestDividFactorsBatch:
         assert result["A"].index.tolist() == ["20260107"]
         assert result["B"].empty
         client._conn.root.get_divid_factors_batch.assert_called_once_with(("A", "B"), "", "")
+
+    def test_adjust_samples_index_restored(self):
+        import pandas as pd
+
+        from xqshare.server import _serialize_for_transfer
+
+        frame = pd.DataFrame({"close": [9.5]}, index=["20260107"])
+        client = XtQuantRemote.__new__(XtQuantRemote)
+        client._ensure_connected = Mock()
+        client._conn = Mock()
+        client._conn.root.get_adjust_samples.return_value = _serialize_for_transfer({"A": frame})
+
+        result = client.get_adjust_samples("front")
+
+        assert result["A"].index.tolist() == ["20260107"]
+        client._conn.root.get_adjust_samples.assert_called_once_with("front", ())

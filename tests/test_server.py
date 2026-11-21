@@ -314,6 +314,31 @@ class TestDataSyncEndpoints:
         result = _deserialize_from_transfer(mock_service.exposed_get_divid_factors_batch(("A", "BAD", "C"), "", ""))
         assert set(result) == {"A", "C"}
 
+    def test_get_adjust_samples_local_backend(self, mock_service):
+        import pandas as pd
+
+        from xqshare.client import _deserialize_from_transfer
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        frame = pd.DataFrame({"close": [9.5]}, index=["20260107"])
+        mock_service._xtdata = Mock()
+        mock_service._xtdata.get_adjust_samples.return_value = {"600000.SH": frame}
+        result = _deserialize_from_transfer(mock_service.exposed_get_adjust_samples("front", ()))
+        assert result["600000.SH"]["close"].tolist() == [9.5]
+        mock_service._xtdata.get_adjust_samples.assert_called_once_with("front", [])
+
+    def test_get_adjust_samples_xtquant_backend(self, mock_service):
+        import pandas as pd
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        mock_service._xtdata = Mock(spec=["get_market_data_ex"])
+        mock_service._xtdata.get_market_data_ex.return_value = {"A": pd.DataFrame({"close": [1.0]})}
+        mock_service.exposed_get_adjust_samples("back", ("A",))
+        args, kwargs = mock_service._xtdata.get_market_data_ex.call_args
+        assert args[1] == ["A"] and kwargs["dividend_type"] == "back" and kwargs["count"] == -1
+        with pytest.raises(ValueError):
+            mock_service.exposed_get_adjust_samples("back", ())
+
     def test_requires_auth(self, mock_service):
         with pytest.raises(AuthError):
             mock_service.exposed_get_update_status()

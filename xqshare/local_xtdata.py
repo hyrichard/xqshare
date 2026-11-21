@@ -20,7 +20,7 @@
     get_financial_data（仅 Capital 股本表）、get_full_tick（用当日已收盘日线近似）、
     get_trading_dates / get_trading_calendar（内置策略用 get_trading_calendar 导出的交易日历，含当年未来交易日）、
     download_history_data / download_history_data2（空操作）。
-    另有 get_update_status（非 xtdata 接口），供服务端返回内置策略的更新状态。
+    另有 get_update_status、get_adjust_samples（非 xtdata 接口），供服务端返回内置策略的更新状态和复权样本。
 
 前复权算法（已与 QMT 的 front_ratio 结果逐 bar 对照一致）：
     每个除权事件映射到不早于除权日的第一根 bar（停牌期间的除权顺延到复牌日），
@@ -66,6 +66,8 @@ DIVID_FIELDS = ["time", "interest", "stockBonus", "stockGift", "allotNum", "allo
 # 本地日线支持的字段；front_ratio 时只有价格字段参与复权
 KLINE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
 PRICE_FIELDS = ["open", "high", "low", "close", "preClose"]
+# 内置策略导出复权样本（validation/<复权类型>/<代码>.csv）的复权类型
+ADJUST_SAMPLE_TYPES = ("front_ratio", "back_ratio", "front", "back")
 
 # 日线 DAT：8 字节文件头 + 每根 bar 64 字节；价格为 1/1000 元整数，time 为北京时间 0 点的 Unix 秒
 DAT_HEADER_SIZE = 8
@@ -778,6 +780,35 @@ class LocalXtdata:
             self._last_status_message = message
             log = logger.info if message.startswith("数据已就绪") else logger.warning
             log(f"[本地行情] {message}")
+
+    def get_adjust_samples(self, dividend_type: str = "front_ratio",
+                           stock_list: Sequence[str] = ()) -> Dict[str, pd.DataFrame]:
+        """返回内置策略导出的 QMT 复权样本（非 xtdata 接口），供同步程序核对自算的复权结果。
+
+        Args:
+            dividend_type: front_ratio / back_ratio / front / back。
+            stock_list: 只返回这些代码；为空时返回全部样本代码。
+
+        Returns:
+            {代码: DataFrame}，index 为日期 YYYYMMDD 字符串，列为 time / open / high / low / close / volume /
+            amount / preClose（QMT 原值）。样本目录不存在时返回空字典。
+
+        Raises:
+            ValueError: dividend_type 不支持。
+        """
+        if dividend_type not in ADJUST_SAMPLE_TYPES:
+            raise ValueError(f"dividend_type 只能是 {'/'.join(ADJUST_SAMPLE_TYPES)}，收到 {dividend_type!r}")
+        folder = os.path.join(self.config.export_dir, "validation", dividend_type)
+        if not os.path.isdir(folder):
+            return {}
+        wanted = {str(code) for code in stock_list}
+        result: Dict[str, pd.DataFrame] = {}
+        for name in sorted(os.listdir(folder)):
+            code = name[:-4]
+            if not name.endswith(".csv") or (wanted and code not in wanted):
+                continue
+            result[code] = pd.read_csv(os.path.join(folder, name), dtype={"date": str}).set_index("date")
+        return result
 
     def get_update_status(self) -> Dict[str, Any]:
         """返回内置策略的更新状态，供同步程序判断数据是否可以入库。

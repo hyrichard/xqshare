@@ -20,7 +20,8 @@
        - meta/instruments.json    品种信息
        - meta/divid_factors.json  除权明细（DividData 是 LevelDB，QMT 运行时加锁，外部不便读取）
        - meta/trading_dates.json  交易日历（内置 get_trading_calendar，含当年剩余的未来交易日）
-    6. 导出少量品种的 QMT front_ratio 结果到 validation/，供 xqshare 自检 DAT 解析与复权口径；
+    6. 导出少量品种的 QMT 四种复权结果到 validation/：front_ratio 供 xqshare 启动自检，
+       四种复权供 market-data 每日核对自算的复权表（经 xqshare get_adjust_samples 读取）；
     7. 写 status.json（state=done/failed）；全部成功时再写 ready.json 作为"已更新好"的标记。
        盘中启动执行时当日 K 线未收盘，不写 ready.json，由当天 SCHEDULE_TIME 的定时任务补上；
     8. 日线部分结束后，逐只调用 download_history_data(代码, 表名, "", "") 下载 FINANCIAL_TABLES 财务表到 datadir
@@ -38,7 +39,7 @@
     meta/instruments.json      {代码: get_instrument_detail 结果}
     meta/divid_factors.json    {代码: [[毫秒时间, 每股红利, 送股, 转增, 配股, 配股价, 股改, dr], ...]}
     meta/trading_dates.json    {"SH": ["YYYYMMDD", ...], "SZ": [...]}，升序，从 TRADING_CALENDAR_START 到当年年底
-    validation/front_ratio/<代码>.csv
+    validation/<复权类型>/<代码>.csv   复权类型为 front_ratio / back_ratio / front / back
     logs/<YYYYMMDD>.log
 
 xqshare 读取约定：
@@ -90,8 +91,13 @@ OPTIONAL_STEPS = ("trading_dates",)
 # 每批取数的品种数量：太大占内存，太小调用次数多
 BATCH_SIZE = 500
 
-# 复权自检品种：导出 QMT 的 front_ratio 结果，供 xqshare 对照自己的计算
-VALIDATE_CODES = ["510300.SH", "159915.SZ", "600519.SH", "601318.SH", "300750.SZ", "000001.SZ"]
+# 复权样本品种：导出 QMT 的复权结果，供 xqshare 自检和 market-data 核对自算的复权表。
+# 覆盖现金分红、多次送转、配股、停牌期间多次除权（600519 2006 年）和 ETF 分红
+VALIDATE_CODES = ["510300.SH", "159915.SZ", "510050.SH", "600519.SH", "601318.SH", "300750.SZ",
+                  "000001.SZ", "000002.SZ", "600036.SH", "600000.SH"]
+
+# 复权样本导出的复权类型（front_ratio 必须保留：xqshare 启动自检使用）
+VALIDATE_DIVIDEND_TYPES = ["front_ratio", "back_ratio", "front", "back"]
 
 # 自检导出字段
 VALIDATE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
@@ -155,7 +161,7 @@ def run_update(C, trigger):
     begin = time.time()
     status = {"state": "running", "trigger": trigger, "started_at": now_text(), "steps": {}, "ok": False}
     try:
-        for sub in ("meta", "validation/front_ratio", "logs"):
+        for sub in ["meta", "logs"] + ["validation/" + t for t in VALIDATE_DIVIDEND_TYPES]:
             os.makedirs(os.path.join(EXPORT_ROOT, sub), exist_ok=True)
         write_json("status.json", status)
         log("===== 开始更新（{}）=====".format(trigger))
@@ -395,19 +401,22 @@ def export_instruments(C, universe):
 
 
 def export_validation(C):
-    """导出自检品种的 QMT front_ratio 日线，供 xqshare 对照自身的 DAT 解析与复权计算。"""
-    data = fetch_klines(C, VALIDATE_CODES, VALIDATE_FIELDS, count=-1, dividend_type="front_ratio")
-    out_dir = os.path.join(EXPORT_ROOT, "validation", "front_ratio")
-    written = 0
-    for code in VALIDATE_CODES:
-        df = data.get(code)
-        if df is not None and not df.empty:
-            out = df.reset_index(drop=False)
-            out = out.rename(columns={out.columns[0]: "date"})
-            out["date"] = out["date"].astype(str).str[:8]
-            write_csv_atomic(os.path.join(out_dir, code + ".csv"), out[["date"] + VALIDATE_FIELDS])
-            written += 1
-    return {"written": written}
+    """导出样本品种的 QMT 各复权类型完整日线，供 xqshare 自检和 market-data 核对复权计算。"""
+    result = {}
+    for dividend_type in VALIDATE_DIVIDEND_TYPES:
+        data = fetch_klines(C, VALIDATE_CODES, VALIDATE_FIELDS, count=-1, dividend_type=dividend_type)
+        out_dir = os.path.join(EXPORT_ROOT, "validation", dividend_type)
+        written = 0
+        for code in VALIDATE_CODES:
+            df = data.get(code)
+            if df is not None and not df.empty:
+                out = df.reset_index(drop=False)
+                out = out.rename(columns={out.columns[0]: "date"})
+                out["date"] = out["date"].astype(str).str[:8]
+                write_csv_atomic(os.path.join(out_dir, code + ".csv"), out[["date"] + VALIDATE_FIELDS])
+                written += 1
+        result[dividend_type] = written
+    return result
 
 
 # ======================= 取数与文件写入 =======================

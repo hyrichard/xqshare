@@ -237,6 +237,8 @@ class AuthError(Exception):
 # ==================== 序列化传输优化 ====================
 
 SERIALIZED_MARKER = "__xqshare_serialized__"
+# xtquant 模式取复权样本的字段，与内置策略导出的 validation 样本一致
+ADJUST_SAMPLE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
 
 
 def _serialize_for_transfer(result):
@@ -1175,6 +1177,27 @@ class XtQuantService(rpyc.Service):
                       "message": "xtquant 行情模式没有内置策略的更新状态"}
         else:
             result = getter()
+        return _serialize_for_transfer(result)
+
+    @log_api_call("get_adjust_samples")
+    def exposed_get_adjust_samples(self, dividend_type: str = "front_ratio",
+                                   stock_list: Sequence[str] = ()) -> Dict[str, Any]:
+        """返回 QMT 复权样本 {代码: DataFrame}，供同步程序核对自算的复权结果。
+
+        本地行情模式读取内置策略导出的 validation/<复权类型>/ 样本（stock_list 为空时返回全部样本）；
+        xtquant 模式直接用 get_market_data_ex 取 stock_list 的完整日线（必须指定 stock_list）。
+        """
+        self._require_auth()
+        self._check_root_permission("get_adjust_samples")
+        codes = [str(code) for code in stock_list]
+        getter = getattr(self._xtdata, "get_adjust_samples", None)
+        if getter is not None:
+            result = getter(dividend_type, codes)
+        else:
+            if not codes:
+                raise ValueError("xtquant 行情模式取复权样本必须指定 stock_list")
+            result = self._xtdata.get_market_data_ex(ADJUST_SAMPLE_FIELDS, codes, period="1d", count=-1,
+                                                     dividend_type=dividend_type)
         return _serialize_for_transfer(result)
 
     @log_api_call("get_divid_factors_batch")
