@@ -381,7 +381,8 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
 1. 大QMT 内置策略 `qmt_builtin/qmt_data_exporter.py`（GBK 编码，粘贴到大QMT 新建 Python 策略，点"运行"）
    在大QMT 启动时执行一次、每天盘后 `SCHEDULE_TIME` 再执行一次（只用大QMT 内置接口，不 import xtquant、不使用线程）：
    - 调用 `download_history_data` 增量更新 datadir 中的日线；
-   - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）；
+   - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）、
+     `meta/trading_dates.json`（交易日历，导出失败不影响 `ready.json`，沿用上次的文件）；
    - 导出 `validation/front_ratio/` 自检样本；
    - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）；
    - 日线部分结束后，逐只调用 `download_history_data(代码, "Capital", "", "")` 下载股本表到 datadir
@@ -427,6 +428,8 @@ XQSHARE_DIVID_SOURCE=export
 | get_instrument_detail / get_instrument_detail_list | 内置策略导出的品种信息 |
 | get_financial_data | 仅 `Capital` 股本表（沪深A股）；`report_type` 支持 `report_time` / `announce_time` |
 | get_full_tick | 没有实时行情：只返回最后一根日线为今天的品种（收盘更新后可用），不含五档盘口 |
+| get_trading_dates | 读 `meta/trading_dates.json`（内置策略用 `get_trading_calendar` 导出），只返回截至今天的交易日 |
+| get_trading_calendar | 同上，含未来交易日（到导出当年年底），返回 `YYYYMMDD` 字符串 |
 | download_history_data / download_history_data2 | 空操作，数据由大QMT 内置策略更新 |
 
 其他 xtdata 接口（订阅、分钟线、Capital 以外的财务报表等）在本地模式下会直接报错"本地行情模式不支持"。
@@ -674,6 +677,21 @@ telnet 192.168.1.100 18812
 status = xt.get_service_status()
 print(status)
 # {'uptime': 3600, 'client_id': 'my-app', 'active_callbacks': 5, 'active_subscriptions': 1}
+```
+
+### 数据同步辅助接口
+
+供入库程序使用，两种行情后端都可调用：
+
+```python
+# 大QMT 内置策略的更新状态（本地行情模式读取 status.json / ready.json；xtquant 模式 status / ready 为 None）
+state = xt.get_update_status()
+# {'backend': 'local', 'status': {'state': 'done', ...}, 'ready': {'trade_date': '20261120', ...},
+#  'message': '数据已就绪：...'}
+
+# 批量取除权数据：一次远程调用返回 {代码: DataFrame}，避免逐只调用 get_divid_factors
+# index 为除权日 YYYYMMDD 字符串；没有除权的代码为空 DataFrame；服务端取数出错的代码不在结果中（服务端日志有记录）
+factors = xt.get_divid_factors_batch(["600000.SH", "510300.SH"])
 ```
 
 ---

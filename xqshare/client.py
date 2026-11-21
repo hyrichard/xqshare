@@ -1198,6 +1198,31 @@ class XtQuantRemote:
         self._ensure_connected()
         return self._conn.root.download_history_data2(stock_list, period, start_time, end_time, incrementally)
 
+    def get_update_status(self) -> dict:
+        """取大QMT 内置策略的数据更新状态。
+
+        Returns:
+            {"backend": "local" / "xtquant", "status": dict 或 None, "ready": dict 或 None, "message": str}。
+            本地行情模式下 status["state"] == "done" 且 ready["trade_date"] 为最新交易日，表示日线已更新完成。
+        """
+        self._ensure_connected()
+        return _deserialize_from_transfer(self._conn.root.get_update_status())
+
+    def get_divid_factors_batch(self, stock_list: list, start_time: str = "", end_time: str = "") -> dict:
+        """批量取除权数据，返回 {代码: DataFrame}，DataFrame 与 xtdata.get_divid_factors 相同（index 为除权日字符串）。
+
+        一次远程调用取完全部代码；代码较多时建议每批 500～1000 只。
+        没有除权的代码返回空 DataFrame；服务端取数出错的代码不在结果中（服务端日志有记录），调用方可据此重试。
+        """
+        self._ensure_connected()
+        # 转为 tuple 按值传给服务端，避免服务端遍历 list 时逐项远程访问
+        result = _deserialize_from_transfer(
+            self._conn.root.get_divid_factors_batch(tuple(str(code) for code in stock_list), start_time, end_time))
+        for frame in result.values():
+            # CSV 传输后 index 会被解析成整数，转回与 get_divid_factors 一致的 YYYYMMDD 字符串
+            frame.index = frame.index.astype(str)
+        return result
+
     def is_connected(self):
         return self._connected
 

@@ -258,3 +258,64 @@ class TestSSLContext:
         with patch.object(mock_ctx, 'load_cert_chain'):
             create_ssl_context("cert.pem", "key.pem")
         mock_ssl_context.assert_called_once()
+
+
+class TestDataSyncEndpoints:
+    """同步程序使用的 exposed 接口：更新状态、批量除权。"""
+
+    def test_get_update_status_local_backend(self, mock_service):
+        from xqshare.client import _deserialize_from_transfer
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        mock_service._xtdata = Mock()
+        mock_service._xtdata.get_update_status.return_value = {"backend": "local", "status": {"state": "done"},
+                                                               "ready": {"trade_date": "20261120"}, "message": "ok"}
+        result = _deserialize_from_transfer(mock_service.exposed_get_update_status())
+        assert result["ready"]["trade_date"] == "20261120"
+
+    def test_get_update_status_xtquant_backend(self, mock_service):
+        from xqshare.client import _deserialize_from_transfer
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        mock_service._xtdata = Mock(spec=["get_divid_factors"])
+        result = _deserialize_from_transfer(mock_service.exposed_get_update_status())
+        assert result["backend"] == "xtquant" and result["status"] is None
+
+    def test_get_divid_factors_batch(self, mock_service):
+        import pandas as pd
+
+        from xqshare.client import _deserialize_from_transfer
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        frame = pd.DataFrame({"time": [1767715200000], "dr": [1.1]}, index=["20260107"])
+        mock_service._xtdata = Mock()
+        mock_service._xtdata.get_divid_factors.side_effect = lambda code, s, e: frame if code == "A" else frame.iloc[:0]
+        result = _deserialize_from_transfer(mock_service.exposed_get_divid_factors_batch(("A", "B"), "", ""))
+        assert set(result) == {"A", "B"}
+        assert result["A"]["dr"].tolist() == [1.1]
+        assert result["B"].empty
+        mock_service._xtdata.get_divid_factors.assert_any_call("B", "", "")
+
+    def test_get_divid_factors_batch_skips_failed_code(self, mock_service):
+        import pandas as pd
+
+        from xqshare.client import _deserialize_from_transfer
+
+        mock_service.exposed_authenticate("free-user", "free-secret")
+        frame = pd.DataFrame({"time": [1767715200000], "dr": [1.1]}, index=["20260107"])
+
+        def fake(code, start, end):
+            if code == "BAD":
+                raise ValueError("unknown code")
+            return frame
+
+        mock_service._xtdata = Mock()
+        mock_service._xtdata.get_divid_factors.side_effect = fake
+        result = _deserialize_from_transfer(mock_service.exposed_get_divid_factors_batch(("A", "BAD", "C"), "", ""))
+        assert set(result) == {"A", "C"}
+
+    def test_requires_auth(self, mock_service):
+        with pytest.raises(AuthError):
+            mock_service.exposed_get_update_status()
+        with pytest.raises(AuthError):
+            mock_service.exposed_get_divid_factors_batch(("A",))

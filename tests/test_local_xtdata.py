@@ -252,6 +252,18 @@ class TestDividSources:
         assert list(frame.index) == ["20260109"]
         np.testing.assert_allclose(frame["dr"], [1.05], rtol=1e-6)
 
+    def test_dat_read_only_when_sources_missing(self, env, monkeypatch):
+        datadir, _, config = env
+        xt = LocalXtdata(config)
+        calls = []
+        original = xt._read_bars
+        monkeypatch.setattr(xt, "_read_bars", lambda code: calls.append(code) or original(code))
+        xt.get_divid_factors("600000.SH")
+        assert calls == []
+        write_dat(datadir, "600002.SH", BARS, dr={"20260109": 1.05})
+        xt.get_divid_factors("600002.SH")
+        assert calls == ["600002.SH"]
+
     def test_divid_frame_format_and_range(self, env):
         _, _, config = env
         frame = LocalXtdata(config).get_divid_factors("600000.SH")
@@ -322,6 +334,35 @@ class TestMetaAndStatus:
         assert "可能未更新" in x.describe_update_status()
         write_json(export, "ready.json", {"trade_date": "29991231", "finished_at": "t"})
         assert x.describe_update_status().startswith("数据已就绪")
+
+    def test_get_update_status_dict(self, env):
+        _, export, config = env
+        x = LocalXtdata(config)
+        empty = x.get_update_status()
+        assert empty["backend"] == "local" and empty["status"] is None and empty["ready"] is None
+        write_json(export, "status.json", {"state": "done"})
+        write_json(export, "ready.json", {"trade_date": "29991231", "finished_at": "t"})
+        result = x.get_update_status()
+        assert result["status"] == {"state": "done"}
+        assert result["ready"]["trade_date"] == "29991231"
+        assert result["message"].startswith("数据已就绪")
+
+    def test_trading_dates_from_export(self, env):
+        _, export, config = env
+        x = LocalXtdata(config)
+        assert x.get_trading_dates("SH") == []
+        assert x.get_trading_calendar("SH") == []
+        dates = [b[0] for b in BARS] + ["29991231"]  # 最后一个为未来交易日
+        write_json(export, "meta/trading_dates.json", {"SH": dates, "SZ": dates[:2]})
+        history = [_day_ms(d) for d in dates[:-1]]
+        assert x.get_trading_dates("SH") == history
+        assert x.get_trading_dates("sh", start_time="20260106", end_time="20260108") == [
+            _day_ms("20260106"), _day_ms("20260108")]
+        assert x.get_trading_dates("SH", count=2) == [_day_ms("20260108"), _day_ms("20260109")]
+        assert x.get_trading_dates("SZ") == history[:2]
+        assert x.get_trading_dates("BJ") == []
+        assert x.get_trading_calendar("SH") == dates
+        assert x.get_trading_calendar("SH", "20260109", "29991231") == ["20260109", "29991231"]
 
     def test_expected_trade_date(self):
         friday_evening = dt.datetime(2026, 11, 20, 17, 0, tzinfo=BEIJING)

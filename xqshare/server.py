@@ -12,7 +12,7 @@ from queue import Empty, Queue
 from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import islice
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import rpyc
 from rpyc.utils.server import ThreadedServer
@@ -1159,6 +1159,52 @@ class XtQuantService(rpyc.Service):
             "active_callbacks": len(XtQuantService._callback_manager.list_callbacks()),
             "active_subscriptions": len(XtQuantService._xtdata_subscriptions),
         }
+
+    @log_api_call("get_update_status")
+    def exposed_get_update_status(self) -> Dict[str, Any]:
+        """返回大QMT 内置策略的数据更新状态（status.json / ready.json），供同步程序判断数据是否已就绪。
+
+        本地行情模式返回 LocalXtdata.get_update_status() 的结果；xtquant 模式没有内置策略的状态文件，
+        返回 backend=xtquant 且 status / ready 为 None。
+        """
+        self._require_auth()
+        self._check_root_permission("get_update_status")
+        getter = getattr(self._xtdata, "get_update_status", None)
+        if getter is None:
+            result = {"backend": "xtquant", "status": None, "ready": None,
+                      "message": "xtquant 行情模式没有内置策略的更新状态"}
+        else:
+            result = getter()
+        return _serialize_for_transfer(result)
+
+    @log_api_call("get_divid_factors_batch")
+    def exposed_get_divid_factors_batch(self, stock_list: Sequence[str], start_time: str = "",
+                                        end_time: str = "") -> Dict[str, Any]:
+        """批量取除权数据，返回 {代码: DataFrame}，DataFrame 与 xtdata.get_divid_factors 相同。
+
+        在服务端循环调用 get_divid_factors，一次远程调用取完全部代码（逐只远程调用约 0.2 秒/只）。
+        单只出错不影响其他代码：出错的代码不出现在结果中并记录警告；没有除权的代码返回空 DataFrame。
+        """
+        self._require_auth()
+        self._check_root_permission("get_divid_factors_batch")
+        result = {}
+        failed = {}
+        for code in (str(item) for item in stock_list):
+            try:
+                result[code] = self._xtdata.get_divid_factors(code, start_time, end_time)
+            except Exception as exc:  # noqa: BLE001 单只失败不影响整批
+                failed[code] = f"{type(exc).__name__}: {exc}"
+        if failed:
+            sample = "; ".join(f"{code} {error}" for code, error in islice(failed.items(), 5))
+            logger.warning(f"[批量除权] {len(failed)} 只取数失败，已从结果中略去 | client={self._client_info} | {sample}")
+        return _serialize_for_transfer(result)
+
+    def _check_root_permission(self, method_name: str) -> None:
+        """检查服务根对象上 exposed 方法的权限，不足时记录日志并抛出 PermissionError。"""
+        error = _check_permission(XtQuantService._permission_checker, self._account_level, method_name)
+        if error:
+            logger.warning(f"[权限拒绝] {method_name} | client={self._client_info} | {error}")
+            raise error
 
     @log_api_call("ping")
     def exposed_ping(self):

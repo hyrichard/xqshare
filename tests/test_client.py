@@ -305,3 +305,23 @@ class TestXtQuantRemote:
         trader_remote_2.connect.assert_called_once()
         trader_remote_2.subscribe.assert_called_once_with("account")
         trader_remote_2.register_callback_bridge.assert_called_once()
+
+
+class TestDividFactorsBatch:
+    def test_index_restored_to_date_string(self):
+        import pandas as pd
+
+        from xqshare.server import _serialize_for_transfer
+
+        frame = pd.DataFrame({"time": [1767715200000], "dr": [1.1]}, index=["20260107"])
+        client = XtQuantRemote.__new__(XtQuantRemote)
+        client._ensure_connected = Mock()
+        client._conn = Mock()
+        client._conn.root.get_divid_factors_batch.return_value = _serialize_for_transfer(
+            {"A": frame, "B": frame.iloc[:0]})
+
+        result = client.get_divid_factors_batch(["A", "B"])
+
+        assert result["A"].index.tolist() == ["20260107"]
+        assert result["B"].empty
+        client._conn.root.get_divid_factors_batch.assert_called_once_with(("A", "B"), "", "")

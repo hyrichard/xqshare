@@ -10,7 +10,7 @@
        - export：内置策略导出的 <export>/meta/divid_factors.json（即 API 返回值，含盘中修正）；
        - dividdata：<datadir>/DividData（LevelDB，客户端启动时更新），定期复制到本地缓存目录后解析；
        - DAT 兜底：K 线记录中自带的单日除权系数，只有 dr 没有明细；
-    3. 板块成份、品种信息：<export>/meta/sectors.json、instruments.json；
+    3. 板块成份、品种信息、交易日历：<export>/meta/sectors.json、instruments.json、trading_dates.json；
        股本表：<datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT；
     4. 更新状态：<export>/status.json、ready.json，用于判断数据是否已更新到最新交易日。
 
@@ -18,7 +18,9 @@
     get_market_data_ex（仅 1d，dividend_type 支持 none / front_ratio）、get_divid_factors、
     get_stock_list_in_sector、get_sector_list、get_instrument_detail、get_instrument_detail_list、
     get_financial_data（仅 Capital 股本表）、get_full_tick（用当日已收盘日线近似）、
+    get_trading_dates / get_trading_calendar（内置策略用 get_trading_calendar 导出的交易日历，含当年未来交易日）、
     download_history_data / download_history_data2（空操作）。
+    另有 get_update_status（非 xtdata 接口），供服务端返回内置策略的更新状态。
 
 前复权算法（已与 QMT 的 front_ratio 结果逐 bar 对照一致）：
     每个除权事件映射到不早于除权日的第一根 bar（停牌期间的除权顺延到复牌日），
@@ -450,7 +452,7 @@ class LocalXtdata:
 
     def _front_ratio_factor(self, code: str, time_ms: np.ndarray, bars: np.ndarray) -> np.ndarray:
         """计算等比前复权系数：事件 dr 落到不早于除权日的第一根 bar，累乘后以最新 bar 归一。"""
-        events = self._divid_events(code, bars)
+        events = self._divid_events(code, lambda: bars)
         per_bar = np.ones(len(time_ms))
         for event in events:
             idx = int(np.searchsorted(time_ms, event[0], side="left"))
@@ -494,6 +496,36 @@ class LocalXtdata:
             }
         return result
 
+    def get_trading_dates(self, market: str, start_time: Any = "", end_time: Any = "", count: int = -1) -> List[int]:
+        """返回截至今天的历史交易日（北京时间 0 点的毫秒时间戳，升序），与 xtdata.get_trading_dates 一致。
+
+        Args:
+            market: 市场代码，如 SH、SZ（以导出文件中的市场为准）。
+            start_time / end_time: 闭区间日期过滤。
+            count: 大于 0 时取区间内最后 count 个交易日。
+        """
+        today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
+        dates = [d for d in self._calendar_dates(market, start_time, end_time) if d <= today]
+        if count is not None and count > 0:
+            dates = dates[-count:]
+        return [_date_to_ms(d) for d in dates]
+
+    def get_trading_calendar(self, market: str, start_time: Any = "", end_time: Any = "") -> List[str]:
+        """返回交易日历 YYYYMMDD 字符串列表（升序，含未来交易日），与 xtdata.get_trading_calendar 一致。
+
+        未来交易日只到内置策略导出时所在年份的年底。
+        """
+        return self._calendar_dates(market, start_time, end_time)
+
+    def _calendar_dates(self, market: str, start_time: Any, end_time: Any) -> List[str]:
+        """读取内置策略用大QMT get_trading_calendar 导出的 meta/trading_dates.json，按区间过滤。
+
+        导出文件不存在或没有该市场时返回空列表。
+        """
+        dates = (self._load_export_json("meta/trading_dates.json") or {}).get(str(market).upper(), [])
+        start, end = _normalize_date(start_time), _normalize_date(end_time)
+        return [d for d in dates if (not start or d >= start) and (not end or d <= end)]
+
     def download_history_data(self, stock_code: str, period: str = "1d", start_time: Any = "", end_time: Any = "",
                               incrementally: Optional[bool] = None) -> None:
         """空操作：本地模式下数据由大QMT 内置策略每日下载。"""
@@ -513,7 +545,8 @@ class LocalXtdata:
 
     def get_divid_factors(self, stock_code: str, start_time: Any = "", end_time: Any = "") -> pd.DataFrame:
         """返回除权数据 DataFrame：index 为除权日 YYYYMMDD，列为 DIVID_FIELDS。"""
-        events = self._divid_events(stock_code, self._read_bars(stock_code))
+        # 只有两个除权来源都没有该品种时才需要读 DAT 兜底，按需读取，避免批量取除权时逐只解析日线
+        events = self._divid_events(stock_code, lambda: self._read_bars(stock_code))
         seconds = np.array([event[0] // 1000 for event in events], dtype="int64")
         frame = pd.DataFrame([list(event) for event in events], columns=DIVID_FIELDS,
                              index=pd.Index(_bar_dates(seconds), dtype=object))
@@ -524,8 +557,13 @@ class LocalXtdata:
             frame = frame[frame.index <= end]
         return frame
 
-    def _divid_events(self, code: str, bars: Optional[np.ndarray]) -> List[DividEvent]:
-        """按配置的优先级取某品种的除权事件：为准的来源 -> 另一来源 -> DAT 自带 dr。"""
+    def _divid_events(self, code: str, load_bars: Callable[[], Optional[np.ndarray]]) -> List[DividEvent]:
+        """按配置的优先级取某品种的除权事件：为准的来源 -> 另一来源 -> DAT 自带 dr。
+
+        Args:
+            code: 品种代码。
+            load_bars: 返回该品种日线记录的函数，只在两个来源都没有该品种、需要 DAT 兜底时才调用。
+        """
         export_events = self._export_divid()
         dividdata_events = self._dividdata()
         self._compare_divid_sources(export_events, dividdata_events)
@@ -535,6 +573,7 @@ class LocalXtdata:
         for source in sources:
             if source is not None and code in source:
                 return source[code]
+        bars = load_bars()
         if bars is None or len(bars) == 0:
             return []
         # 两个来源都没有该品种：用 K 线记录里的单日 dr 兜底，只能提供 dr，明细置 0
@@ -740,10 +779,27 @@ class LocalXtdata:
             log = logger.info if message.startswith("数据已就绪") else logger.warning
             log(f"[本地行情] {message}")
 
+    def get_update_status(self) -> Dict[str, Any]:
+        """返回内置策略的更新状态，供同步程序判断数据是否可以入库。
+
+        Returns:
+            {"backend": "local", "status": status.json 内容, "ready": ready.json 内容, "message": 一句话描述}；
+            文件不存在时对应项为 None。status.state 为 done 且 ready.trade_date 为最新交易日时表示日线已就绪。
+        """
+        # 两个文件只读一次，保证 status、ready 与 message 对应同一时刻的内容
+        status = self._read_small_json("status.json")
+        ready = self._read_small_json("ready.json")
+        return {"backend": "local", "status": status, "ready": ready,
+                "message": self._describe_status(status or {}, ready or {})}
+
     def describe_update_status(self) -> str:
         """读取 status.json / ready.json，返回一句话的更新状态描述。"""
-        status = self._read_small_json("status.json") or {}
-        ready = self._read_small_json("ready.json") or {}
+        return self._describe_status(self._read_small_json("status.json") or {},
+                                     self._read_small_json("ready.json") or {})
+
+    @staticmethod
+    def _describe_status(status: Dict[str, Any], ready: Dict[str, Any]) -> str:
+        """根据 status.json、ready.json 的内容生成一句话的更新状态描述。"""
         if status.get("state") == "running":
             return f"大QMT 内置策略正在更新数据（开始于 {status.get('started_at')}），DAT 可能处于更新中"
         if status.get("state") == "failed":
@@ -839,6 +895,12 @@ def _same_events(left: List[DividEvent], right: List[DividEvent]) -> bool:
     if len(left) != len(right):
         return False
     return all(abs(a - b) <= 1e-9 for x, y in zip(left, right) for a, b in zip(x, y))
+
+
+def _date_to_ms(date_text: str) -> int:
+    """YYYYMMDD -> 北京时间 0 点的毫秒时间戳（xtdata 交易日、bar 时间的口径）。"""
+    day = dt.datetime.strptime(date_text, "%Y%m%d").replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+    return int(day.timestamp()) * 1000
 
 
 def _expected_trade_date(now: dt.datetime) -> str:

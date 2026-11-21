@@ -52,6 +52,10 @@ API_PERMISSIONS: Dict[str, Permission] = {
     "xtdata.get_sector_list": Permission.BASIC,
     "get_all_stocks": Permission.BASIC,
     "get_index_list": Permission.BASIC,
+    "xtdata.get_trading_dates": Permission.BASIC,
+    "xtdata.get_trading_calendar": Permission.BASIC,
+    "get_update_status": Permission.BASIC,
+    "get_divid_factors_batch": Permission.BASIC,
 
     # ==================== daily 权限 ====================
     # get_market_data 和 get_market_data_ex 的 period 参数决定权限
