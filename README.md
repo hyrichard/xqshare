@@ -381,8 +381,8 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
 1. 大QMT 内置策略 `qmt_builtin/qmt_data_exporter.py`（GBK 编码，粘贴到大QMT 新建 Python 策略，点"运行"）
    在大QMT 启动时执行一次、每天盘后 `SCHEDULE_TIME` 再执行一次（只用大QMT 内置接口，不 import xtquant、不使用线程）：
    - 调用 `download_history_data` 增量更新 datadir 中的日线；
-   - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）、
-     `meta/trading_dates.json`（交易日历，导出失败不影响 `ready.json`，沿用上次的文件）；
+   - 导出 `meta/sectors.json`（板块成份）、`meta/instruments.json`（品种信息）、`meta/divid_factors.json`（除权）；
+     不导出交易日历（内置 `get_trading_calendar` 只有投研版大QMT 提供）；
    - 导出 `validation/<复权类型>/` 复权样本（front_ratio / back_ratio / front / back，QMT 原值）；
    - 写 `status.json`（state 为 running / done / failed）和 `ready.json`（最近一次成功更新的交易日）；
    - 日线部分结束后，逐只调用 `download_history_data(代码, "Capital", "", "")` 下载股本表到 datadir
@@ -428,11 +428,10 @@ XQSHARE_DIVID_SOURCE=export
 | get_instrument_detail / get_instrument_detail_list | 内置策略导出的品种信息 |
 | get_financial_data | 仅 `Capital` 股本表（沪深A股）；`report_type` 支持 `report_time` / `announce_time` |
 | get_full_tick | 没有实时行情：只返回最后一根日线为今天的品种（收盘更新后可用），不含五档盘口 |
-| get_trading_dates | 读 `meta/trading_dates.json`（内置策略用 `get_trading_calendar` 导出），只返回截至今天的交易日 |
-| get_trading_calendar | 同上，含未来交易日（到导出当年年底），返回 `YYYYMMDD` 字符串 |
 | download_history_data / download_history_data2 | 空操作，数据由大QMT 内置策略更新 |
 
-其他 xtdata 接口（订阅、分钟线、Capital 以外的财务报表等）在本地模式下会直接报错"本地行情模式不支持"。
+其他 xtdata 接口（订阅、分钟线、Capital 以外的财务报表、`get_trading_dates` / `get_trading_calendar` 等）
+在本地模式下会直接报错"本地行情模式不支持"；交易日历请从 Tushare 获取。
 
 本地模式没有盘中实时价格，纸面交易（`XQSHARE_TRADER_MODE=paper`）在盘中取不到成交参考价，市价单会被拒绝。
 
@@ -704,6 +703,7 @@ samples = xt.get_adjust_samples("front", stock_list=["600519.SH"])
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 2.0.5 | 2026-11-22 | 普通版大QMT 没有交易日历接口：内置脚本不再导出，本地模式不再支持交易日接口 |
 | 2.0.4 | 2026-11-22 | 本地模式支持交易日历；新增同步辅助接口；内置脚本导出交易日历和四种复权样本 |
 | 2.0.1 | 2026-10-24 | 客户端未提供 userdata_path 时统一使用服务端 `QMT_USERDATA_PATH`，客户端可不配置该路径 |
 | 2.0.0 | 2026-10-23 | 版本号升级为 2.0.0，作者新增 hyrichard |

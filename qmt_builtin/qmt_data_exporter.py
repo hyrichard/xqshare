@@ -19,7 +19,7 @@
        - meta/sectors.json        板块成份
        - meta/instruments.json    品种信息
        - meta/divid_factors.json  除权明细（DividData 是 LevelDB，QMT 运行时加锁，外部不便读取）
-       - meta/trading_dates.json  交易日历（内置 get_trading_calendar，含当年剩余的未来交易日）
+       交易日历不导出：内置 get_trading_calendar 只有投研版提供，交易日历从 Tushare 获取。
     6. 导出少量品种的 QMT 四种复权结果到 validation/：front_ratio 供 xqshare 启动自检，
        四种复权供 market-data 每日核对自算的复权表（经 xqshare get_adjust_samples 读取）；
     7. 写 status.json（state=done/failed）；全部成功时再写 ready.json 作为"已更新好"的标记。
@@ -38,7 +38,6 @@
     meta/sectors.json          {板块名: [代码, ...]}
     meta/instruments.json      {代码: get_instrument_detail 结果}
     meta/divid_factors.json    {代码: [[毫秒时间, 每股红利, 送股, 转增, 配股, 配股价, 股改, dr], ...]}
-    meta/trading_dates.json    {"SH": ["YYYYMMDD", ...], "SZ": [...]}，升序，从 TRADING_CALENDAR_START 到当年年底
     validation/<复权类型>/<代码>.csv   复权类型为 front_ratio / back_ratio / front / back
     logs/<YYYYMMDD>.log
 
@@ -80,13 +79,6 @@ EXPORT_SECTORS = ["沪深A股", "上证A股", "深证A股", "创业板", "科创板", "沪深ETF"
 
 # 判断最新交易日的基准品种（上证指数每个交易日都有 bar）
 CALENDAR_CODE = "000001.SH"
-
-# 交易日历：用内置 get_trading_calendar 取各市场从 TRADING_CALENDAR_START 到当年年底的交易日，
-# 导出到 meta/trading_dates.json（含未来交易日）
-TRADING_CALENDAR_MARKETS = ["SH", "SZ"]
-TRADING_CALENDAR_START = "19900101"
-# 失败时不影响整次更新是否成功（ready.json 照常写入）的步骤：交易日历变化少，失败时沿用上次导出的文件
-OPTIONAL_STEPS = ("trading_dates",)
 
 # 每批取数的品种数量：太大占内存，太小调用次数多
 BATCH_SIZE = 500
@@ -172,13 +164,12 @@ def run_update(C, trigger):
         status["universe_size"] = len(universe)
         run_step(status, "download", lambda: download_klines(universe))
         check = run_step(status, "check", lambda: check_latest(C, universe)) or {}
-        run_step(status, "trading_dates", lambda: export_trading_dates(C))
         run_step(status, "divid_factors", lambda: export_divid_factors(C, universe))
         run_step(status, "instruments", lambda: export_instruments(C, universe))
         run_step(status, "validation", lambda: export_validation(C))
 
         status["trade_date"] = check.get("trade_date", "")
-        status["ok"] = all(step["ok"] for name, step in status["steps"].items() if name not in OPTIONAL_STEPS)
+        status["ok"] = all(step["ok"] for step in status["steps"].values())
     except Exception:
         status["error"] = traceback.format_exc()
         log("更新异常:\n" + status["error"])
@@ -260,7 +251,7 @@ def run_step(status, name, func):
 
 
 def write_ready(status):
-    """写"已更新好"标记；只在必需步骤（OPTIONAL_STEPS 以外）全部成功时调用。"""
+    """写"已更新好"标记；只在全部步骤成功时调用。"""
     steps = status["steps"]
     ready = {
         "trade_date": status.get("trade_date", ""),
@@ -347,24 +338,6 @@ def check_latest(C, universe):
                 stale.append(code)
     return {"trade_date": trade_date, "latest_count": latest, "stale_count": len(stale),
             "stale_sample": stale[:30]}
-
-
-def export_trading_dates(C):
-    """导出交易日历到 meta/trading_dates.json；返回各市场的交易日数量、首尾日期和今天之后的交易日数量。"""
-    today = datetime.date.today().strftime("%Y%m%d")
-    end = "{}1231".format(today[:4])
-    result = {}
-    info = {}
-    for market in TRADING_CALENDAR_MARKETS:
-        raw = get_trading_calendar(market, TRADING_CALENDAR_START, end)  # noqa: F821 内置全局函数
-        dates = sorted(set(str(item) for item in (raw or [])))
-        if not dates:
-            raise RuntimeError("get_trading_calendar({}) 没有返回交易日".format(market))
-        result[market] = dates
-        future = sum(1 for d in dates if d > today)
-        info[market] = "{} 个 {}~{} 今天之后 {} 个".format(len(dates), dates[0], dates[-1], future)
-    write_json("meta/trading_dates.json", result)
-    return info
 
 
 def export_divid_factors(C, universe):

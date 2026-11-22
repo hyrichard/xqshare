@@ -362,22 +362,12 @@ class TestMetaAndStatus:
         with pytest.raises(ValueError):
             xt.get_adjust_samples("none")
 
-    def test_trading_dates_from_export(self, env):
-        _, export, config = env
-        x = LocalXtdata(config)
-        assert x.get_trading_dates("SH") == []
-        assert x.get_trading_calendar("SH") == []
-        dates = [b[0] for b in BARS] + ["29991231"]  # 最后一个为未来交易日
-        write_json(export, "meta/trading_dates.json", {"SH": dates, "SZ": dates[:2]})
-        history = [_day_ms(d) for d in dates[:-1]]
-        assert x.get_trading_dates("SH") == history
-        assert x.get_trading_dates("sh", start_time="20260106", end_time="20260108") == [
-            _day_ms("20260106"), _day_ms("20260108")]
-        assert x.get_trading_dates("SH", count=2) == [_day_ms("20260108"), _day_ms("20260109")]
-        assert x.get_trading_dates("SZ") == history[:2]
-        assert x.get_trading_dates("BJ") == []
-        assert x.get_trading_calendar("SH") == dates
-        assert x.get_trading_calendar("SH", "20260109", "29991231") == ["20260109", "29991231"]
+    def test_trading_dates_not_supported(self, env):
+        """普通版大QMT 没有交易日历接口，本地模式不提供交易日，调用方改用 Tushare。"""
+        x = LocalXtdata(env[2])
+        for name in ("get_trading_dates", "get_trading_calendar"):
+            with pytest.raises(AttributeError, match="不支持"):
+                getattr(x, name)("SH")
 
     def test_expected_trade_date(self):
         friday_evening = dt.datetime(2026, 11, 20, 17, 0, tzinfo=BEIJING)
