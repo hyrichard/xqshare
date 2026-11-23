@@ -12,12 +12,13 @@
        - DAT 兜底：K 线记录中自带的单日除权系数，只有 dr 没有明细；
     3. 板块成份、品种信息：<export>/meta/sectors.json、instruments.json；
        股本表：<datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT；
-    4. 更新状态：<export>/status.json、ready.json，用于判断数据是否已更新到最新交易日。
+    4. 更新状态：<export>/status.json、ready.json，用于判断数据是否已更新到最新交易日；
+    5. 盘中快照：<export>/tick/full_tick.json，由内置策略 qmt_tick_exporter.py 定时导出（大QMT get_full_tick 原始结果）。
 
 支持的接口：
     get_market_data_ex（仅 1d，dividend_type 支持 none / front_ratio）、get_divid_factors、
     get_stock_list_in_sector、get_sector_list、get_instrument_detail、get_instrument_detail_list、
-    get_financial_data（仅 Capital 股本表）、get_full_tick（用当日已收盘日线近似）、
+    get_financial_data（仅 Capital 股本表）、get_full_tick（读内置策略导出的最新快照；未部署时用当日已收盘日线近似）、
     download_history_data / download_history_data2（空操作）。
     另有 get_update_status、get_adjust_samples（非 xtdata 接口），供服务端返回内置策略的更新状态和复权样本。
 
@@ -65,6 +66,8 @@ DIVID_FIELDS = ["time", "interest", "stockBonus", "stockGift", "allotNum", "allo
 # 本地日线支持的字段；front_ratio 时只有价格字段参与复权
 KLINE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
 PRICE_FIELDS = ["open", "high", "low", "close", "preClose"]
+# 内置策略 qmt_tick_exporter.py 导出的最新全市场快照
+TICK_FILE = "tick/full_tick.json"
 # 内置策略导出复权样本（validation/<复权类型>/<代码>.csv）的复权类型
 ADJUST_SAMPLE_TYPES = ("front_ratio", "back_ratio", "front", "back")
 
@@ -463,19 +466,54 @@ class LocalXtdata:
         return cumulative / cumulative[-1]
 
     def get_full_tick(self, code_list: Sequence[str]) -> Dict[str, Dict[str, Any]]:
-        """用当日已收盘的日线近似全推快照。
+        """返回最新快照 {代码: 快照字典}，与 xtdata.get_full_tick 相同；传入 SH / SZ 时展开为该市场全部品种。
 
-        本地没有实时行情：只有最后一根日线日期等于今天（北京时间）的品种才返回，
-        盘中或当日数据尚未更新时返回空，调用方会按"取不到快照"处理，避免把昨天的价格当成今天。
-        不提供五档盘口字段，防止下单逻辑误用。传入 SH / SZ 市场代码时展开为该市场全部已知品种。
+        - 导出目录有 tick/full_tick.json（部署了内置策略 qmt_tick_exporter.py）：返回其中今天（北京时间）的快照，
+          字段为大QMT get_full_tick 原始结果（含五档盘口）。与日线近似一样不返回上一交易日的数据，
+          避免把昨天的价格当成今天；盘中返回的是最近一个导出时间点的快照，调用方按 time / timetag 判断是否够新；
+        - 没有该文件或读取失败：用当日已收盘的日线近似（见 _full_tick_from_bars）。
+        """
+        if os.path.exists(os.path.join(self.config.export_dir, TICK_FILE)):
+            exported = self._load_export_json(TICK_FILE)
+            if exported is not None:
+                return self._exported_ticks(exported, code_list)
+        return self._full_tick_from_bars(code_list)
+
+    def _exported_ticks(self, exported: Dict[str, Any], code_list: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """从导出文件中取所需代码今天的快照；大QMT 只给 timetag 字符串时补上 xtdata 的 time（毫秒时间戳）。
+
+        日期按快照的 timetag 判断；timetag 格式无法识别时按文件导出时间 generated_at 判断。
         """
         today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
-        codes: List[str] = []
-        for item in code_list:
-            if item in ("SH", "SZ"):
-                codes.extend(code for code in self._instruments() if code.endswith("." + item))
-            else:
-                codes.append(item)
+        file_date = str(exported.get("generated_at", ""))[:10].replace("-", "")
+        ticks = exported.get("ticks") or {}
+        result: Dict[str, Dict[str, Any]] = {}
+        for code in _expand_markets(code_list, ticks):
+            tick = ticks.get(code)
+            if not isinstance(tick, dict):
+                continue
+            time_ms = tick.get("time")
+            if time_ms is None:
+                time_ms = _timetag_ms(tick.get("timetag"))
+            tick_date = file_date if time_ms is None else dt.datetime.fromtimestamp(
+                int(time_ms) / 1000, dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
+            if tick_date != today:
+                continue
+            # 复制（含五档列表），避免调用方修改缓存
+            tick = {key: list(value) if isinstance(value, list) else value for key, value in tick.items()}
+            if time_ms is not None:
+                tick.setdefault("time", time_ms)
+            result[code] = tick
+        return result
+
+    def _full_tick_from_bars(self, code_list: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """用当日已收盘的日线近似全推快照（未部署快照导出策略时使用）。
+
+        只有最后一根日线日期等于今天（北京时间）的品种才返回，盘中或当日数据尚未更新时返回空，
+        调用方会按"取不到快照"处理，避免把昨天的价格当成今天。不提供五档盘口字段，防止下单逻辑误用。
+        """
+        today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d")
+        codes = _expand_markets(code_list, self._instruments())
         result: Dict[str, Dict[str, Any]] = {}
         for code in codes:
             bars = self._read_bars(code)
@@ -908,3 +946,23 @@ def _expected_trade_date(now: dt.datetime) -> str:
         while day.weekday() >= 5:
             day -= dt.timedelta(days=1)
     return day.strftime("%Y%m%d")
+
+
+def _expand_markets(code_list: Sequence[str], known: Dict[str, Any]) -> List[str]:
+    """代码列表中的 SH / SZ 展开为 known 中该市场的全部代码，其余原样保留。"""
+    codes: List[str] = []
+    for item in code_list:
+        if item in ("SH", "SZ"):
+            codes.extend(code for code in known if code.endswith("." + item))
+        else:
+            codes.append(item)
+    return codes
+
+
+def _timetag_ms(timetag: Any) -> Optional[int]:
+    """大QMT 快照的 timetag（北京时间 "YYYYMMDD HH:MM:SS"，可能带毫秒）转为毫秒时间戳；格式不符时返回 None。"""
+    try:
+        moment = dt.datetime.strptime(str(timetag)[:17], "%Y%m%d %H:%M:%S")
+    except ValueError:
+        return None
+    return int(moment.replace(tzinfo=dt.timezone(dt.timedelta(hours=8))).timestamp() * 1000)

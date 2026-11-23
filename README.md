@@ -389,13 +389,17 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
      （配置项 `FINANCIAL_TABLES`，实测沪深A股 5224 只约 66 秒）；结果记入 `status.json` 的 `financial` 字段，
      不影响 `state` 和 `ready.json`；
    - 大QMT 所有内置策略共用一个线程，脚本运行期间（约 5~7 分钟）其他内置策略暂停。
-2. xqshare 服务端读取：
+2. （可选）大QMT 内置策略 `qmt_builtin/qmt_tick_exporter.py`（GBK 编码，另建一个 Python 策略运行）
+   在配置的 `SCHEDULE_TIMES` 每个时间对沪深A股、沪深ETF、沪深指数调用 `get_full_tick`，
+   原样保存为 `tick/full_tick.json`（只保留最新一份，每次整体覆盖）；时间点避开日线导出运行的 5~7 分钟。
+3. xqshare 服务端读取：
    - 日线：`<datadir>/<SH|SZ>/86400/<代码>.DAT`；
    - 除权：导出的 `divid_factors.json` 与 `<datadir>/DividData`（定期复制到本地缓存后解析），按配置决定以哪个为准，
      另一个作为补充，都没有时使用 DAT 自带的除权系数兜底；两个来源不一致时在服务端日志中告警；
    - 板块、品种信息：导出的 JSON；
    - 股本表：`<datadir>/Finance/<SH|SZ>/86400/<代码>_7004.DAT`；
-   - 更新状态：`status.json` / `ready.json`，正在更新、更新失败或数据落后时在服务端日志中告警。
+   - 更新状态：`status.json` / `ready.json`，正在更新、更新失败或数据落后时在服务端日志中告警；
+   - 盘中快照：`tick/full_tick.json`（部署了快照导出策略时）。
 
 启动时会用 `validation/front_ratio/` 对照本地前复权计算结果，误差超过 1e-6 时告警。
 
@@ -427,13 +431,14 @@ XQSHARE_DIVID_SOURCE=export
 | get_stock_list_in_sector / get_sector_list | 内置策略导出的板块（沪深A股、上证A股、深证A股、创业板、科创板、沪深ETF、沪深指数） |
 | get_instrument_detail / get_instrument_detail_list | 内置策略导出的品种信息 |
 | get_financial_data | 仅 `Capital` 股本表（沪深A股）；`report_type` 支持 `report_time` / `announce_time` |
-| get_full_tick | 没有实时行情：只返回最后一根日线为今天的品种（收盘更新后可用），不含五档盘口 |
+| get_full_tick | 部署了 `qmt_tick_exporter.py` 时返回 `tick/full_tick.json` 中**今天**的快照（大QMT 原始字段，含五档盘口；只有 `timetag` 时补 `time` 毫秒时间戳），盘中是最近一个导出时间点的数据，按 `time` / `timetag` 判断是否够新；未部署或文件读取失败时只返回最后一根日线为今天的品种（收盘更新后可用），不含五档盘口 |
 | download_history_data / download_history_data2 | 空操作，数据由大QMT 内置策略更新 |
 
 其他 xtdata 接口（订阅、分钟线、Capital 以外的财务报表、`get_trading_dates` / `get_trading_calendar` 等）
 在本地模式下会直接报错"本地行情模式不支持"；交易日历请从 Tushare 获取。
 
-本地模式没有盘中实时价格，纸面交易（`XQSHARE_TRADER_MODE=paper`）在盘中取不到成交参考价，市价单会被拒绝。
+本地模式没有盘中实时价格，纸面交易（`XQSHARE_TRADER_MODE=paper`）在盘中取不到成交参考价，市价单会被拒绝；
+部署了快照导出策略后，纸面交易会用今天最近一次快照的最新价作为参考价（可能是一个导出间隔之前的价格）。
 
 ---
 
@@ -703,6 +708,7 @@ samples = xt.get_adjust_samples("front", stock_list=["600519.SH"])
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| 2.0.6 | 2026-11-23 | 新增大QMT 内置盘中快照导出脚本 `qmt_tick_exporter.py`；本地模式 `get_full_tick` 读取导出的今天的快照（含五档盘口），未部署时仍用当日日线近似 |
 | 2.0.5 | 2026-11-22 | 普通版大QMT 没有交易日历接口：内置脚本不再导出，本地模式不再支持交易日接口 |
 | 2.0.4 | 2026-11-22 | 本地模式支持交易日历；新增同步辅助接口；内置脚本导出交易日历和四种复权样本 |
 | 2.0.1 | 2026-10-24 | 客户端未提供 userdata_path 时统一使用服务端 `QMT_USERDATA_PATH`，客户端可不配置该路径 |

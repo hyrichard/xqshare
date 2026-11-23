@@ -317,6 +317,38 @@ class TestMetaAndStatus:
         assert tick["lastPrice"] == 9.8 and tick["lastClose"] == 9.5 and tick["volume"] == 1400
         assert "askPrice" not in tick
 
+    def test_full_tick_from_exported_file(self, env):
+        """部署了快照导出策略时读 tick/full_tick.json：只返回今天的快照（含五档），补 time，展开市场代码。"""
+        _, export, config = env
+        now = dt.datetime.now(BEIJING).replace(microsecond=0)
+        today, yesterday = now.strftime("%Y%m%d"), (now - dt.timedelta(days=1)).strftime("%Y%m%d")
+        tick = {"timetag": f"{today} 10:30:05", "lastPrice": 9.8, "lastClose": 9.5, "volume": 1400,
+                "askPrice": [9.81, 9.82, 9.83, 9.84, 9.85], "bidVol": [10, 20, 30, 40, 50]}
+        write_json(export, local_xtdata.TICK_FILE, {
+            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "ticks": {"600000.SH": tick, "000001.SZ": {"timetag": "x", "lastPrice": 1.0},
+                      "600036.SH": {"timetag": f"{yesterday} 15:00:00", "lastPrice": 2.0}}})
+        x = LocalXtdata(config)
+        result = x.get_full_tick(["SH", "510300.SH"])
+        assert list(result) == ["600000.SH"]  # 昨天的快照、文件中没有的代码都不返回
+        assert result["600000.SH"]["askPrice"] == tick["askPrice"]
+        moment = dt.datetime.strptime(f"{today} 10:30:05", "%Y%m%d %H:%M:%S").replace(tzinfo=BEIJING)
+        assert result["600000.SH"]["time"] == int(moment.timestamp()) * 1000
+        result["600000.SH"]["askPrice"][0] = 0  # 修改返回值（含列表）不影响缓存
+        assert x.get_full_tick(["600000.SH"])["600000.SH"]["askPrice"][0] == 9.81
+        # timetag 格式无法识别时按文件导出日期判断，不补 time
+        assert x.get_full_tick(["SZ"]) == {"000001.SZ": {"timetag": "x", "lastPrice": 1.0}}
+
+    def test_full_tick_falls_back_to_bars_when_file_unreadable(self, env):
+        datadir, export, config = env
+        today = dt.datetime.now(BEIJING).strftime("%Y%m%d")
+        write_dat(datadir, "600000.SH", BARS + [(today, 9.5, 9.9, 9.4, 9.8, 1400, 13_720_000, 9.5)])
+        path = os.path.join(str(export), local_xtdata.TICK_FILE)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{坏文件")
+        assert LocalXtdata(config).get_full_tick(["600000.SH"])["600000.SH"]["lastPrice"] == 9.8
+
     def test_download_is_noop_with_callback(self, env):
         _, _, config = env
         received = []
