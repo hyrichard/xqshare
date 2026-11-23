@@ -14,7 +14,8 @@
     1. 写 status.json（state=running），告诉 xqshare 正在更新 DAT；
     2. 取板块成份，确定品种池（沪深A股 + 沪深ETF + 沪深指数）；
     3. download_history_data 逐只增量补日线到 datadir（xqshare 读的就是这些 DAT）；
-    4. 检查最新交易日：取全市场最后一根日线，统计已更新到最新交易日的品种数；
+    4. 检查最新交易日：只取基准品种 CALENDAR_CODE 的最后一根日线（不对全市场取日线：内置 get_market_data_ex
+       即使只取 1 根，也会把该品种全部历史日线读进大QMT 自身的缓存且不释放，全市场约占 3.7GB）；
     5. 导出 DAT 之外的数据（xqshare 不直接解析这些格式）：
        - meta/sectors.json        板块成份
        - meta/instruments.json    品种信息
@@ -55,8 +56,10 @@ xqshare 读取约定：
 """
 
 import datetime
+import gc
 import json
 import os
+import sys
 import time
 import traceback
 
@@ -79,9 +82,6 @@ EXPORT_SECTORS = ["沪深A股", "上证A股", "深证A股", "创业板", "科创板", "沪深ETF"
 
 # 判断最新交易日的基准品种（上证指数每个交易日都有 bar）
 CALENDAR_CODE = "000001.SH"
-
-# 每批取数的品种数量：太大占内存，太小调用次数多
-BATCH_SIZE = 500
 
 # 复权样本品种：导出 QMT 的复权结果，供 xqshare 自检和 market-data 核对自算的复权表。
 # 覆盖现金分红、多次送转、配股、停牌期间多次除权（600519 2006 年）和 ETF 分红
@@ -152,6 +152,7 @@ def run_update(C, trigger):
     _RUNNING = True
     begin = time.time()
     status = {"state": "running", "trigger": trigger, "started_at": now_text(), "steps": {}, "ok": False}
+    log("开始前 " + memory_text())
     try:
         for sub in ["meta", "logs"] + ["validation/" + t for t in VALIDATE_DIVIDEND_TYPES]:
             os.makedirs(os.path.join(EXPORT_ROOT, sub), exist_ok=True)
@@ -163,7 +164,7 @@ def run_update(C, trigger):
         universe = build_universe(sectors)
         status["universe_size"] = len(universe)
         run_step(status, "download", lambda: download_klines(universe))
-        check = run_step(status, "check", lambda: check_latest(C, universe)) or {}
+        check = run_step(status, "check", lambda: check_latest(C)) or {}
         run_step(status, "divid_factors", lambda: export_divid_factors(C, universe))
         run_step(status, "instruments", lambda: export_instruments(C, universe))
         run_step(status, "validation", lambda: export_validation(C))
@@ -184,6 +185,8 @@ def run_update(C, trigger):
         finally:
             # 无论上面是否出错都要复位，否则之后每天的定时任务都会被当成"仍在进行"而跳过
             _RUNNING = False
+            gc.collect()  # 先回收再记录，看脚本数据释放后进程内存是否回落
+            log("全部结束并回收后 " + memory_text())
 
 
 def finish_update(status, begin):
@@ -241,12 +244,12 @@ def run_step(status, name, func):
         result = func()
         info = result if isinstance(result, dict) else {}
         status["steps"][name] = dict(ok=True, seconds=round(time.time() - begin, 1), **info)
-        log("[OK] {} {}".format(name, info))
+        log("[OK] {} {} {}".format(name, info, memory_text()))
         return result
     except Exception:
         status["steps"][name] = {"ok": False, "seconds": round(time.time() - begin, 1),
                                  "error": traceback.format_exc()}
-        log("[FAIL] {}\n{}".format(name, status["steps"][name]["error"]))
+        log("[FAIL] {} {}\n{}".format(name, memory_text(), status["steps"][name]["error"]))
         return None
 
 
@@ -259,7 +262,6 @@ def write_ready(status):
         "trigger": status["trigger"],
         "universe_size": status.get("universe_size", 0),
         "download_failed": steps.get("download", {}).get("failed", 0),
-        "latest_count": steps.get("check", {}).get("latest_count", 0),
     }
     write_json("ready.json", ready)
 
@@ -296,7 +298,7 @@ def download_klines(universe):
         except Exception as exc:
             failed.append("{}: {!r}".format(code, exc))
         if idx % 1000 == 0:
-            log("download 进度 {}/{}".format(idx, len(universe)))
+            log("download 进度 {}/{} {}".format(idx, len(universe), memory_text()))
     return {"total": len(universe), "failed": len(failed), "failed_sample": failed[:20]}
 
 
@@ -313,31 +315,21 @@ def download_financial(C):
             except Exception as exc:
                 failed.append("{} {}: {!r}".format(code, table, exc))
         if idx % 1000 == 0:
-            log("financial 进度 {}/{}".format(idx, len(codes)))
+            log("financial 进度 {}/{} {}".format(idx, len(codes), memory_text()))
     return {"total": len(codes), "tables": list(FINANCIAL_TABLES), "failed": len(failed),
             "failed_sample": failed[:20]}
 
 
-def check_latest(C, universe):
-    """确定最新交易日，并统计最后一根日线已到该日的品种数（停牌/未上市品种不会到）。"""
+def check_latest(C):
+    """用基准品种（上证指数，每个交易日都有 bar）的最后一根日线确定最新交易日。
+
+    只取这一只：内置 get_market_data_ex 即使只取 1 根，也会把品种的全部历史日线读进大QMT 的缓存且不释放，
+    对全市场逐只取会让大QMT 进程多占约 3.7GB 内存。各品种是否更新到最新交易日由 market-data 入库后在库中判断。
+    """
     cal = fetch_klines(C, [CALENDAR_CODE], ["time"], count=1).get(CALENDAR_CODE)
     if cal is None or cal.empty:
         raise RuntimeError("取不到 {} 的日线，无法确定最新交易日".format(CALENDAR_CODE))
-    trade_date = str(cal.index[-1])[:8]
-    latest = 0
-    stale = []
-    for start in range(0, len(universe), BATCH_SIZE):
-        batch = universe[start:start + BATCH_SIZE]
-        data = fetch_klines(C, batch, ["time"], count=1)
-        for code in batch:
-            df = data.get(code)
-            last = str(df.index[-1])[:8] if df is not None and not df.empty else ""
-            if last == trade_date:
-                latest += 1
-            else:
-                stale.append(code)
-    return {"trade_date": trade_date, "latest_count": latest, "stale_count": len(stale),
-            "stale_sample": stale[:30]}
+    return {"trade_date": str(cal.index[-1])[:8]}
 
 
 def export_divid_factors(C, universe):
@@ -414,6 +406,40 @@ def write_json(rel_path, obj):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, ensure_ascii=False, default=str)
     os.replace(tmp, path)
+
+
+def memory_text():
+    """大QMT 进程当前内存和 Python 持有的内存块数（内置 Python 运行在大QMT 进程内，读到的就是大QMT 的内存）。
+
+    工作集：进程当前占用的物理内存（含映射进内存的数据文件，任务管理器"内存"列与之接近）；
+    私有：进程自己申请的内存（不含映射文件）；Python 内存块：Python 对象占用的小块数量，脚本数据释放后应回落。
+    对照各步骤前后的变化可以区分：Python 内存块回落而进程内存不降，说明占用来自大QMT 自身，不是脚本没有释放。
+    """
+    blocks = "Python 内存块 {:.1f}万".format(sys.getallocatedblocks() / 10000.0)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        getter = ctypes.windll.psapi.GetProcessMemoryInfo
+        getter.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+        if getter(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return "[内存] 工作集 {:.0f}MB（峰值 {:.0f}MB），私有 {:.0f}MB，{}".format(
+                counters.WorkingSetSize / 1048576.0, counters.PeakWorkingSetSize / 1048576.0,
+                counters.PagefileUsage / 1048576.0, blocks)
+    except Exception:
+        pass
+    return "[内存] 进程内存读取失败，{}".format(blocks)
 
 
 def now_text():

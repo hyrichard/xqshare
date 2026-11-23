@@ -388,7 +388,12 @@ miniQMT 不可用时，服务端可以改为直接读取同一台机器上大QMT
    - 日线部分结束后，逐只调用 `download_history_data(代码, "Capital", "", "")` 下载股本表到 datadir
      （配置项 `FINANCIAL_TABLES`，实测沪深A股 5224 只约 66 秒）；结果记入 `status.json` 的 `financial` 字段，
      不影响 `state` 和 `ready.json`；
-   - 大QMT 所有内置策略共用一个线程，脚本运行期间（约 5~7 分钟）其他内置策略暂停。
+   - 大QMT 所有内置策略共用一个线程，脚本运行期间（约 5~7 分钟）其他内置策略暂停；
+   - 判断最新交易日只取基准品种 000001.SH 的最后一根日线；每步日志带大QMT 进程内存，便于排查内存占用。
+     注意：取除权、取日线会让大QMT 把相应品种的全部历史日线读进自身缓存，全市场一次约多占 3.5GB，
+     不随脚本结束释放，系统会在之后逐步换出；
+   - **xtquant 版** `qmt_builtin/qmt_xtquant_exporter.py`：功能和输出文件与上面完全相同，
+     在大QMT"原生Python"模式下运行，取数和下载改用 `xtquant.xtdata`；两个脚本二选一运行，不要同时运行。
 2. （可选）大QMT 内置策略 `qmt_builtin/qmt_tick_exporter.py`（GBK 编码，另建一个 Python 策略运行）
    在配置的 `SCHEDULE_TIMES` 每个时间对沪深A股、沪深ETF、沪深指数调用 `get_full_tick`，
    原样保存为 `tick/full_tick.json`（只保留最新一份，每次整体覆盖）；时间点避开日线导出运行的 5~7 分钟。
