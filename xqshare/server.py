@@ -2,6 +2,7 @@
 XtQuant Share (xqshare) Server - Run on Windows to provide xtquant proxy service
 """
 
+import ast
 import json
 import logging
 import os
@@ -15,6 +16,7 @@ from itertools import islice
 from typing import Any, Dict, Optional, Sequence
 
 import rpyc
+from rpyc.core.netref import BaseNetref
 from rpyc.utils.server import ThreadedServer
 
 from .auth import (
@@ -241,6 +243,50 @@ SERIALIZED_MARKER = "__xqshare_serialized__"
 ADJUST_SAMPLE_FIELDS = ["time", "open", "high", "low", "close", "volume", "amount", "preClose"]
 
 
+def _json_default(value: Any) -> Any:
+    """JSON 无法直接序列化的值：numpy 数值、数组（及 pandas Series）转为 Python 数值、列表，其他转为字符串。
+
+    不能一律 str()：numpy 数值、数组会变成字符串，客户端拿到的就不再是数字或列表。
+    """
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return str(value)
+
+
+# ==================== 参数取回本地 ====================
+
+# 可以整体取回的远程引用参数类型（rpyc netref 的类名 -> 本地类型）
+LOCALIZABLE_NETREF_TYPES = {"builtins.list": list, "builtins.tuple": tuple, "builtins.dict": dict}
+
+
+def _localize_value(value: Any) -> Any:
+    """把客户端传来的 list / tuple / dict 远程引用一次性取回服务端。
+
+    rpyc 只按值传递字符串、数字、元组等不可变类型，list、dict 传过来的是远程引用（netref）：服务端每读一个元素
+    都要回客户端取一次（局域网约 1.4 毫秒一次，7000 多只代码的列表就是 10 秒）。这里请求一次远程 repr 取回整个
+    容器的文本，再用 ast.literal_eval 还原：只接受字面量，不执行代码，也不像 rpyc obtain 那样反序列化客户端的
+    pickle 数据。含函数、numpy 数值等非字面量元素时无法还原，原样返回远程引用（行为与原来相同）。
+    """
+    if not isinstance(value, BaseNetref):
+        return value
+    expected = LOCALIZABLE_NETREF_TYPES.get(type(value).__name__)
+    if expected is None:
+        return value
+    try:
+        local = ast.literal_eval(repr(value))
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return value
+    return local if isinstance(local, expected) else value
+
+
+def _localize_call(args: Any, kwargs: Any) -> tuple:
+    """把一次调用的位置参数和关键字参数中的远程容器取回本地，返回 (args 元组, kwargs 字典)。"""
+    args = _localize_value(args)
+    kwargs = _localize_value(kwargs)
+    return (tuple(_localize_value(value) for value in args),
+            {key: _localize_value(value) for key, value in dict(kwargs).items()})
+
+
 def _serialize_for_transfer(result):
     """将结果序列化以优化 RPyC 传输性能"""
     if result is None:
@@ -277,20 +323,20 @@ def _serialize_for_transfer(result):
 
             if has_dataframe_recursive(result):
                 serialized_dict = serialize_dataframes(result)
-                json_str = json.dumps(serialized_dict, ensure_ascii=False, default=str)
+                json_str = json.dumps(serialized_dict, ensure_ascii=False, default=_json_default)
                 return {SERIALIZED_MARKER: "dict_with_dataframe", "data": json_str}
         except ImportError:
             pass
 
         try:
-            json_str = json.dumps(result, ensure_ascii=False, default=str)
+            json_str = json.dumps(result, ensure_ascii=False, default=_json_default)
             return {SERIALIZED_MARKER: "json", "data": json_str}
         except (TypeError, ValueError):
             pass
 
     if isinstance(result, (list, tuple)):
         try:
-            json_str = json.dumps(result, ensure_ascii=False, default=str)
+            json_str = json.dumps(result, ensure_ascii=False, default=_json_default)
             return {SERIALIZED_MARKER: "json", "data": json_str}
         except (TypeError, ValueError):
             pass
@@ -716,6 +762,8 @@ class LoggingProxy:
         if callable(attr):
             def wrapper(*args, **kwargs):
                 full_name = f"{target_name}.{name}"
+                # 先把 list / dict 参数取回本地，之后的权限检查、日志和调用都不再逐项远程访问
+                args, kwargs = _localize_call(args, kwargs)
                 error = _check_permission(permission_checker, account_level, full_name, args, kwargs)
                 if error:
                     api_logger.warning(f"[权限拒绝] {full_name} | client={get_client_info()} | {error}")
@@ -827,7 +875,8 @@ class TraderBridge:
         return None
 
     def invoke_async_bridge(self, method_name: str, args, kwargs, callback_id: str, dispatcher):
-        self._check(f"xttrader.{method_name}", tuple(args), dict(kwargs))
+        args, kwargs = _localize_call(args, kwargs)
+        self._check(f"xttrader.{method_name}", args, kwargs)
         self._callback_manager.register(
             callback_id,
             dispatcher,
@@ -1062,6 +1111,7 @@ class XtQuantService(rpyc.Service):
     def exposed_subscribe_xtdata_bridge(self, method_name: str, args: tuple, kwargs: dict,
                                         callback_id: str, dispatcher):
         self._require_auth()
+        args, kwargs = _localize_call(args, kwargs)
 
         full_name = f"xtdata.{method_name}"
         permission_kwargs = dict(kwargs)
@@ -1120,6 +1170,7 @@ class XtQuantService(rpyc.Service):
     @log_api_call("download_history_data2")
     def exposed_download_history_data2(self, stock_list: list, period: str = "1d",
                                        start_time: str = "", end_time: str = "", incrementally: bool = None):
+        stock_list = _localize_value(stock_list)
         status = {'finished': 0, 'total': 0, 'done': False, 'result': {}, 'message': ''}
 
         def on_progress(data):
@@ -1140,27 +1191,28 @@ class XtQuantService(rpyc.Service):
             stock_list, period, start_time, end_time,
             callback=on_progress, incrementally=incrementally
         )
-        return status
+        # 序列化后返回：直接返回 dict 时客户端拿到的是远程引用，读每个字段都要回服务端一次
+        return _serialize_for_transfer(status)
 
     @log_api_call("get_all_stocks")
     def exposed_get_all_stocks(self):
         self._require_auth()
-        return self._xtdata.get_stock_list_in_sector("沪深A股")
+        return _serialize_for_transfer(self._xtdata.get_stock_list_in_sector("沪深A股"))
 
     @log_api_call("get_index_list")
     def exposed_get_index_list(self):
         self._require_auth()
-        return self._xtdata.get_stock_list_in_sector("沪深指数")
+        return _serialize_for_transfer(self._xtdata.get_stock_list_in_sector("沪深指数"))
 
     @log_api_call("get_service_status")
     def exposed_get_service_status(self):
         self._require_auth()
-        return {
+        return _serialize_for_transfer({
             "uptime": time.time() - getattr(self, '_start_time', time.time()),
             "client_id": self._client_id,
             "active_callbacks": len(XtQuantService._callback_manager.list_callbacks()),
             "active_subscriptions": len(XtQuantService._xtdata_subscriptions),
-        }
+        })
 
     @log_api_call("get_update_status")
     def exposed_get_update_status(self) -> Dict[str, Any]:

@@ -1187,16 +1187,17 @@ class XtQuantRemote:
 
     def get_all_stocks(self):
         self._ensure_connected()
-        return self._conn.root.get_all_stocks()
+        return _deserialize_from_transfer(self._conn.root.get_all_stocks())
 
     def get_index_list(self):
         self._ensure_connected()
-        return self._conn.root.get_index_list()
+        return _deserialize_from_transfer(self._conn.root.get_index_list())
 
     def download_history_data2(self, stock_list: list, period: str = "1d",
                                start_time: str = "", end_time: str = "", incrementally: bool = None):
         self._ensure_connected()
-        return self._conn.root.download_history_data2(stock_list, period, start_time, end_time, incrementally)
+        return _deserialize_from_transfer(
+            self._conn.root.download_history_data2(stock_list, period, start_time, end_time, incrementally))
 
     def get_update_status(self) -> dict:
         """取大QMT 内置策略的数据更新状态。
@@ -1246,7 +1247,7 @@ class XtQuantRemote:
 
     def get_service_status(self):
         self._ensure_connected()
-        return self._conn.root.get_service_status()
+        return _deserialize_from_transfer(self._conn.root.get_service_status())
 
     def reconnect(self):
         self._reconnect()
